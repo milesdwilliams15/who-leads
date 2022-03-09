@@ -1,0 +1,1887 @@
+---
+title: "Who Leads? The Strategic Determinants of Lead Donorship"
+author: "Miles D. Williams"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  pdf_document:
+    number_sections: true
+classoption: fleqn
+fontfamily: mathpazo
+fontsize: 12pt
+bibliography: "`r paste0(stringr::str_remove(getwd(), '/04_empirics'), '/02_cites/ref.bib')`"
+link-citations: yes
+linkcolor: blue
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{setspace}
+  - \setlength\parindent{24pt}
+  - \setlength{\parskip}{0.0pt plus 1.0pt}
+  - \doublespacing
+  - \usepackage{caption}\captionsetup[table]{skip=5pt}
+  - \usepackage{dcolumn}
+  - \usepackage{caption}\DeclareCaptionLabelFormat{AppendixTables}{A.#2}
+  - \usepackage{wrapfig}
+  - \usepackage{float}
+  - \floatplacement{figure}{!t}
+
+abstract: "Lead donorship in foreign aid has been linked to positive development outcomes in recipient countries, but little is known about the factors that give rise to it. When, where, and why does lead donorship emerge in the relationships between donor governments and aid recipients? I argue that this phenomenon has its roots in the strategic aid allocation decisions of donor governments vis-a-vis one another. Lead donorship emerges when and where a single donor has incentives and ability to dominate in its relationship with a developing country while other donors have incentives to pass the buck. On the basis of prior theory and research, I contend that a donor will have the greatest likelihood of holding lead donor status in recipients with deepest need for foreign aid where that donor has stronger comparative foreign policy interests relative to other donors. A statistical analysis of lead donorship from 1998 to 2014 yields results consistent with theoretical predictions. Subsequent case studies of lead donorship in Southeast Asia and South America provide additional support for the theoretical argument while also providing insight into additional conditions in donors and in recipients that facilitate lead donorship. The analysis is enabled by two novel composite measures that capture theoretically relevant determinants of donor giving, one of donor interest (DI) and the other of recipient need (RN). It is hoped that by improving understanding of the process that gives rise to lead donorship, it will be possible to leverage stronger causal claims about its impact on aid efficacy."
+---
+
+**Key Words**: Lead Donorship; Foreign Aid
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F,
+                      message = F,
+                      warning = F,
+                      cache = T)
+library(tidyverse)
+library(estimatr)
+library(texreg)
+library(ggpattern)
+library(mgcv)
+findComb = function(vars){
+  
+  # standardize values...
+  vars = vars %>%
+    mutate_all(function(x)(x-mean(x))/sd(x)) %>%
+    as.matrix()
+  
+  # make the objective...
+  objective = function(vars,d){
+    #vars = cbind(1, vars)
+    pc = vars%*%d
+    scor = apply(vars, 2, function(x) cov(pc, x)^2)
+    ssc = sum(scor)
+    return(-ssc)
+  }
+  
+  # run the optimizer...
+  out = optim(
+    fn = objective,
+    vars = vars,
+    par=rep(0,len=ncol(vars))
+  )
+  
+  # get the pc...
+  pc = as.matrix(vars)%*%out$par
+  
+  # standardize the pc...
+  pc = (pc-mean(pc))/sd(pc)
+  
+  # get correlations with components...
+  cors = apply(vars,2,function(x)cor(x,pc))
+  
+  # return the pc and cor. matrix...
+  return(
+    list(
+      pc = pc,
+      corMat = cors,
+      weights = out$par
+    )
+  )
+}
+
+
+dt <- read_csv('01_data/final_data.csv') 
+
+dt <- dt %>%
+  group_by(recipient, year) %>%
+  mutate(peer_dist = log((sum(dist) - dist) / (n() - 1)),
+         peer_ties = (sum(ties) - ties) / (n() - 1)) %>%
+  ungroup() %>%
+  mutate(
+    dy = as.factor(paste0(donor, year)),
+    dyad = as.factor(paste0(donor, recipient))
+  )
+
+dt <- dt %>%
+  mutate(
+    fh_total = max(fh_total)-fh_total
+  ) %>%
+  group_by(dyad) %>%
+  mutate_at(
+    .vars = c("ihs_trade","colony","income","fh_total",
+              "pop","civilwar"),
+    .funs = function(x) lag(x, order_by = .data$year)
+  ) %>%
+  ungroup() %>%
+  na.omit
+ties <- dt %>%
+  select(dist, ihs_trade, colony, ally) %>%
+  mutate(dist = log(dist)) %>%
+  findComb(.)
+#ties$corMat
+need <- dt %>%
+  select(income, pop, ihs_disaster, fh_total, civilwar) %>%
+  mutate(
+    income = log(income),
+    pop = log(pop)
+  ) %>%
+  findComb(.)
+#need$corMat
+dt$ties <- ties$pc[,1]
+dt$need <- need$pc[,1]
+dt <- dt %>%
+  group_by(recipient, year) %>%
+  mutate(
+    peer_ties = (sum(ties) - ties) / (n() - 1)
+  ) %>% ungroup()
+nw <- need$weights
+tw <- ties$weights
+pca_ties <- prcomp(
+  with(dt, cbind(dist, ihs_trade, colony, ally)),
+  scale = T
+)
+pca_need <- prcomp(
+  with(dt, cbind(income, pop, ihs_disaster, fh_total, civilwar)),
+  scale = T
+)
+dt <- dt %>%
+  mutate(
+    new_need = need - nw[4] * fh_total - nw[4] * fh_total,
+    new_ties = ties - nw[4] * ally  - nw[4] * ally
+  ) %>%
+  mutate(
+    new_need = (new_need - mean(new_need)) / sd(new_need),
+    new_ties = (new_ties - mean(new_ties)) / sd(new_ties)
+  ) %>%
+  mutate(
+    pca_need = pca_need$x[, 1],
+    pca_ties = pca_ties$x[, 1]
+  )
+
+theme_set(theme_bw())
+# Conceptualization of lead donor status (Steinwand 2010):
+#   1. HI > median HI
+#   2. top aid - second top aid > median across other recipients
+#   3. aid share > median aid share
+#   4. aid > aid from all others
+#   5. lagged rolling 
+
+roll_ave <- function(x) {
+  x <- xn <- c(NA, NA, x)
+  for(i in 3:length(x)) {
+    x[i] <- mean(xn[(i-2):i], na.rm=T)
+  }
+  x <- x[3:length(x)]
+  return(x)
+}
+
+# Define lead donorship bilaterally:
+dt %>%
+  group_by(recipient, year) %>%
+  mutate(
+    aid_share = aid / sum(aid),
+    HI = sum(aid_share^2),
+    top_donor = (aid==max(aid)),
+    top_share = max(aid_share),
+    aid_1st = max(aid),
+    aid_2nd = sort(aid, decreasing = T)[2],
+    aid_diff = aid_1st - aid_2nd,
+    # aid_share = aid / sum(aid),
+    # aid_share_gt = aid_share > median(aid_share),
+    # top_donor = (aid==max(aid))+0,
+    # fst_aid = max(aid),
+    # snd_aid = sort(aid, decreasing = T)[2],
+    ties_share = (ties - min(ties)) / sum(ties - min(ties))
+  ) %>%
+  ungroup %>%
+  
+  # Steinwand's measure
+  mutate(
+    lead_donor_year = ifelse(
+      (HI > median(HI)) &
+        (aid_diff > median(aid_diff)) &
+        (aid_share > median(aid_share)) &
+        top_donor,
+      1, 0
+    )
+  ) %>%
+  arrange(year) %>%
+  group_by(donor, recipient) %>%
+  mutate(
+    lead_donor = roll_ave(lead_donor_year)
+  ) %>%
+  ungroup -> dt
+```
+
+# Introduction
+
+An ongoing debate in academic and policy circles centers on donor fragmentation---a condition in which a developing country receives foreign aid from a multitude of donor governments with no obvious leader contributing the largest share. While some contend that a fragmented aid supply overburdens recipient bureaucracy and does harm to its political institutions [see @acharyaEtAl2006; @djankovEtAl2009; @knackRahman2007], others caution that the negative impact of fragmentation is overstated and that a more diverse aid supply in fact has positive effects in some development sectors [@gehringEtAl2017].\footnote{Education is one example where fragmentation may have a positive impact.}
+
+While the authors of the previous study rightly warn against sweeping generalizations about the effects of aid fragmentation, their analysis uncovers a nuance that is relevant to the strategic determinants that give rise to it. In particular, @gehringEtAl2017 show that, in addition to recipient bureaucratic capacity, the absence of a "lead donor" plays a role in driving the negative effects of fragmentation. In other words, fragmentation creates problems not when it follows from a *multitude* of donors, but when not enough responsibility for giving aid *concentrates in a single donor*. 
+
+Despite the importance of lead donorship in mitigating the negative consequences of fragmentation, the determinants of lead donorship remain under-studied. To provide a foundation for understanding of the causal role of lead donorship on aid effectiveness, a necessary first step is to understand the process that gives rise to it. So, *when*, *where*, and *why* does lead donorship emerge?
+
+I put forth the argument that lead donorship is the product of donor governments pursuing their own self-interest *vis*-$\grave{\textit{a}}$-*vis* one another. Foreign aid serves as a multipurpose foreign policy tool for donor governments. By extension, since donors do not exist in a vacuum, aid allocation inevitably serves as an arena in which donors must compete to maximize their foreign policy interests. Donors not only should strategically target aid on the basis of where others target theirs, but also should base the magnitude and direction of their response in light of recipient need for aid and the strength of their foreign policy interests. 
+
+In particular, because of the leverage it confers donors, high need recipients serve as ideal targets for political, economic, or strategic aid-for-policy exchange when and where such goals matter to donors [@buenoDeMesquitaSmith2009; @bermeo2018]. Such interests also tend to have rival benefits, so it follows that the confluence of high recipient need and strong donor interest coincide with competitive donor responses. Conversely, absent strong non-development foreign policy interests, high need recipients should garner attention from donors primarily for their development need. In these cases, donors may collectively benefit from aid projects regardless of who has greatest responsibility for funding them. As a result, high need and low interest should coincide with buck-passing behavior among donors as they seek to reap the benefits of recipient development at minimal cost to themselves.
+
+This pattern in donor responses has clear and observable implications for when and where lead donorship should emerge. Specifically, a donor government should have the greatest likelihood of contributing an outsized share of aid in *high need recipients* where that donor has *the strongest foreign policy interest* relative to other donors. In high need recipients, the donors that lack strong material, geostrategic, or social motivations for allocating aid have the greatest incentive to defer responsibility to more interested parties. At the same time, donors for whom foreign policy goals have the greatest salience will have incentives to dominate in their relationship with such recipients to maximize their interests.
+
+To test this prediction I use a mixed-methods approach. First, I rely on a dataset of bilateral aid allocations from 29 DAC countries across 24 key development sectors to more than 120 recipient countries. Using a measure of lead donorship and composite measures of donor interest (DI) and recipient need (RN) for aid, I find that lead donorship has the greatest likelihood of emerging precisely when and where theory predicts: at the confluence of high comparative interest for one donor government relative to others and high need for foreign assistance in a recipient. 
+
+Following the statistical analysis, I examine patterns in lead donorship in Southeast Asia and South America. These two regions merit study as "deviant" and "extreme-on-X" cases, respectively. In the former, Japan exercises outsized dominance despite other donor governments having strong interests in Southeast Asia. In the latter, the United States stands out for its comparatively strong foreign policy interests, yet it nonetheless enjoys less preeminence than anticipated. These cases highlight additional material and political factors in donors and recipients that facilitate lead donorship. 
+
+In Southeast Asia, Japan's leadership stems not from its strength of interest relative to other donors or its size as a donor. Rather, Japan has greater interest in Southeast Asia relative to other parts of the world, while other donors with strong interests in the region have even stronger interests elsewhere. This gives Japan a comparative advantage since its interests lead it to allocate the plurality of its aid to the region. This underscores an additional dimension of comparative donor interest that the main statistical analysis did not capture.
+
+In South America, the United States initially held lead donor status with relatively greater frequency than other donors. However beginning in the late 2000s this began to change due to material factors in the U.S. and political considerations in South American countries. In response to the 2008 financial crisis, the U.S. made significant cuts to its foreign aid budget, not only in South America but also globally. Only a few years later, several countries in South America expelled U.S. aid personnel and opposed U.S. development projects for perceived meddling and conspiring against recipient governments. While demonstrating how political and material considerations beyond those measured in the main analysis shape patterns in lead donorship, the response of other donors in the region to changes in U.S. giving in fact support the theoretical argument. The U.S. turns out to be an exception that gives other donors in the region a chance to prove the rule.
+
+These findings pose some problems for past research and raise new questions for future study. For instance, @steinwand2015 argues that lead donorship can arise for both uncooperative and collusive reasons. Specifically, lead donorship may result from uncoordinated buck-passing when and where aid produces collective benefits for the donor community, or from cooperative agreements to defer responsibility to a single donor when and where rival foreign policy goals are in play. This analysis supports the former, but certainly does not rule out the latter. It does not help that a clear and unproblematic measure of when and where cooperation is at work is not available. Even conditioning donor responses on the presence of lead donorship is problematic since its presence is endogenous to the strategic factors that give rise to it. This, then, is an important question for future study. At the moment, the evidence provided here suggests lead donorship is predominantly the product of an uncoordinated general equilibrium, and until a way of reliably capturing collusion is developed it will be difficult to demonstrate otherwise.
+
+Another issue for future consideration centers on leveraging knowledge of the process that gives rise to lead donorship to make causal claims about its impact on aid efficacy. In particular, some of the latest political science research on aid effectiveness emphasizes the role of aid conditionality---conditions donors place on aid that a recipient government must enact in exchange for receiving funds---as a requisite for aid having a positive impact on development [@bearceTirone2010; @girod2012]. How does lead donorship relate to the ability of donor governments to credibly commit to conditionality?
+
+These, and more questions, represent fruitful avenues of research for scholars interested in uncoiling the lacuna that is foreign aid. This analysis provides the first systematic empirical analysis of the determinants of lead donorship and thus provides a basis for informed debate about cooperation and fragmentation in international development.
+
+
+# Why Does Lead Donorship Matter?
+
+Conceptually, lead donorship has a straightforward definition. According to @steinwand2015, lead donorship is an instance where a single donor has a long-term relationship with an aid recipient and is responsible for the greatest share of foreign aid said recipient receives. 
+
+Lead donorship matters for its significance for aid effectiveness, or the extent to which receiving foreign aid maps to economic development in recipient countries. Though no consensus on the issue exists, a number of studies point to reasons that aid fragmentation, or the degree to which an aid recipient receives aid from diffuse sources, has a deleterious effect on economic development. Fragmentation, of course, has an inverse relationship with lead donorship by definition: high fragmentation equates to no lead donor.
+
+Some cite costs to recipient government administrative capacity as one mechanism through which fragmentation takes its toll. In a special handbook overview of the economics of foreign aid, @kanbur2006 writes:
+
+\bigskip
+
+> In a typical African country, there can be upwards of 20 aid agencies from different countries and multilateral agencies. The hard-pressed civil servants [of these African countries] spend much of their time managing the paper flow. At the political level, ministers have to spend a considerable amount of time in turn meeting with donor delegations (1,579).
+
+\bigskip
+
+As @kanbur2006 goes on to note, the time it takes recipient bureaucrats to engage with donor agencies comes at the cost of listening to domestic interest groups and those most familiar with local conditions and development needs. This may increase the likelihood of mismatches between the development goals of, and types of resources provided by, donors and the actual needs of recipients.
+
+Beyond excessive administrative burden, some scholars suggest fragmentation damages bureaucratic quality itself. @knackRahman2007 demonstrate via a game-theoretic model and cross-country panel data from 1982 to 2001 that an increase in aid fragmentation results in a significant decline in bureaucratic quality, as measured by the International Country Risk Guide (ICRG). The authors cite poaching as one of the key mechanisms driving this effect. Donor agencies often have to provide tangible evidence of project effectiveness, and to do so they have incentives to supplement the pay of especially talented local bureaucrats to function as consultants. As @knackRahman2007 note, this practice has incentive distorting effects in the pool of local staff and also draws the most talented civil servants away from responsibilities that arguably would have greater development impact. 
+
+Fragmentation enters the equation by way of the collective action problem poaching creates among donors: more donors equates to more poaching, leading to more poaching by individual donors to snatch up talented staff before other donors do the same. Fragmentation thereby accelerates the rate of poaching, draining the local talent pool even more than if only one or a few donors operated in a recipient.
+
+Outside of factors on the recipient side, @anderson2012 points to transaction costs on the donor side. He claims that fragmentation may increase the burden that donors face when interacting with recipients by preventing them from exploiting economies of scale. Results from Anderson's dyadic panel analysis of administrative costs associated with development programs by 23 DAC countries from 1984 to 2009 suggest that fragmentation leads to an estimated 2.5 billion U.S. dollars in extra administrative burden. By reducing the efficiency by which total development funding maps to the actual implementation of development projects, fragmentation limits the overall impact of each additional dollar of aid a donor spends.
+
+Related to the problem of transaction costs, fragmentation may also weaken the credibility of aid conditionality. Some evidence suggests that foreign aid exercises its effect on development, not only or primarily through the development projects it supports themselves, but when donors place conditions on the receipt of funds. In this view, aid allocation functions as a form of political exchange [@buenoDeMesquitaSmith2009]. By conditioning their support on the adoption of pro-market economic and political reforms by recipients, donors can incentivize development. Though evidence remains far from conclusive, several studies provide compelling support for the view that aid conditionality in both bilateral and multilateral contexts has a positive economic impact in recipients [see @bearceTirone2010; @girod2012; @smetsKnack2016; @mollSmets2018].
+
+However, a number of intervening factors may limit the efficacy of conditionality. For instance, the so-called "Samaritan's Curse," or disutility incurred from cutting aid, can prevent donors from making credible commitments to impose conditions. These might result from bureaucratic incentives to move money out the door [@svensson2003], or when donors' strategic goals supersede their interest in promoting development [@bearceTirone2010; @girod2012; @kanbur2000; @kilby2009]. Conditionality further only has bite to the extent that recipient governments lack alternative sources of revenue [@girod2012].
+
+Aid fragmentation has direct links to both the Samaritan's Curse and recipient dependence. On both counts, the presence of donor competition implied by fragmentation is the chief culprit. This issue has taken on special relevance in light of China's expanding international development finance activities. China has a reputation for imposing few conditions on its aid relative to traditional DAC donors, and as a consequence multilateral development institutions such as the World Bank and bilateral donors such as the United States have reduced the number of conditions they impose, and changed the types of projects they support, in order to compete [@hernandez2017; @zeitz2021]. However, while much of the literature centers on the competitive challenge posed by China, traditional DAC donors remain far from united in their priorities and often harbor concerns about maintaining their interests and influence *vis*-$\grave{a}$-*vis* each other as well [@steinwand2015]. Indeed, in the multi-donor environment DAC countries have inhabited for decades, aid from the United States in Northern Africa can represent just as much a source of competitive pressure for France as infrastructure projects financed by the People's Republic of China in Sub-Saharan Africa.
+
+Competition, then, makes conditionality difficult to enforce for donors. Not only may donors suffer disutility from cutting aid by losing out on their foreign policy goals to competitors, but also the presence of many donors likely mitigates the economic cost to the recipient if a donor cuts aid.^[On the point of recipient dependence, it bears noting that a lack of fragmentation could be a double-edged sword. While it may improve a donor's leverage with a recipient government, research points to a possible link between aid fragmentation, aid volatility, and political violence. @guttingSteinwand2015 find that greater fragmentation limits exposure to negative aid shocks (sudden and substantial declines in aid revenue) and, hence, to the impact that such shocks can have on the incidence of violent conflict.] Thus, to the extent that it suggests greater donor competition in a recipient, aid fragmentation will limit the economic impact of foreign aid. 
+
+In sum, lead donorship should have direct relevance for international development. By reducing fragmentation in the aid supply to a given recipient, lead donorship may result in less administrative burden and damage to recipient bureaucratic capacity, reduced transaction costs for donors, enhanced credibility and bite of conditionality, and less waste due to donor competition.
+
+
+# What Is Lead Donorship?
+
+As a matter of observation, identifying clear cases of lead donorship (narrowly defined in terms of high donor concentration) should be easy enough---so, too, with identifying clear cases of its absence. To illustrate, consider Figure 1, which shows the share of aid committed by the top DAC donor in a given year to two aid recipients: Mexico and Mozambique. These data come from the OECD's Creditor Reporting System (CRS) and reflect the total of bilateral Official Development Assistance (ODA) commitments in 2017 constant U.S. dollars across the 24 main development sectors as defined by the OECD. Abbreviated country names are included so it is clear which donor is responsible for committing the top share of aid. Also, lighter columns have been added that indicate the share of aid committed by the donor responsible for the second greatest amount in a given year. This provides a point of reference for how much more the top donor in a given year committed relative to the next most generous donor.
+
+```{r, fig.height=4, fig.width=10, fig.cap="Aid shares of top donors to Mexico and Mozambique."}
+dt %>%
+  mutate(
+    donor_code = countrycode::countrycode(
+      donor, "country.name", "iso3c"
+    )
+  ) %>%
+  filter(
+    recipient %in% c("Mexico", "Mozambique")
+  ) %>%
+  group_by(recipient, year) %>%
+  transmute(
+    donor_code = donor_code,
+    aid_share = aid / sum(aid),
+    aid_1st = aid_share == sort(aid_share, decreasing = T)[1],
+    aid_2nd = aid_share == sort(aid_share, decreasing = T)[2]
+  ) %>%
+  filter(
+    aid_1st | aid_2nd
+  ) %>%
+  ungroup %>%
+  group_split(aid_2nd) -> plt_dt
+
+ggplot(plt_dt[[1]]) +
+  aes(year, aid_share, label = donor_code) +
+  geom_col() +
+  geom_text(vjust = .5, hjust = 1, angle = 90,
+            color = "white", fontface = "bold") +
+  geom_text(
+    aes(label = round(aid_share*100)),
+    vjust = -.5
+  ) +
+  geom_col(
+    data = plt_dt[[2]],
+    aes(year, aid_share),
+    fill = "lightgrey",
+    alpha = 0.4,
+    width = 0.75
+  ) +
+  facet_wrap(~ recipient) + 
+  scale_x_continuous(
+    breaks = 1996:2014
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Aid Share"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, hjust = 1
+    ),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  ) 
+```
+
+Among the 29 DAC countries committing foreign aid across 24 development sectors to Mexico, the United States held top donor status for 14 out of 19 years from 1996 to 2014. The U.S. further bore responsibility for, not just the plurality, but the majority of aid for eight of those years. This comes as little surprise. Mexico shares a border with the United States and has greater long-term security and diplomatic importance for the U.S. government than for other DAC members.
+
+Conversely, over this same period the share of aid committed by the top DAC donor per year to Mozambique was 23$\%$ on average, declining to as low as 15$\%$ in 2005, and only climbing as high as 46$\%$ in 2008 before falling to 22$\%$ the next year. While the United States committed the largest share of aid for several years, top donor status fluctuated among a group donors from 1996 to 2007. And, even though the U.S. committed the most aid to Mozambique from 2008 to 2014, in nearly all of those years (2008 being the exception), the second most generous donor did not fall far behind.\footnote{The sizeable and rapid jump in U.S. support in 2008 coincided with the onset of a devastating flood in Mozambique in early 2008 that killed several and displaced tens of thousands. Total DAC giving to Mozambique increased to 1.78 billion from 1.5 billion 2017 constant U.S. dollars this same year. It is interesting to note that the U.S. was responsible for much of this increase. However, in the following years, in addition to aid totals slowly declining, the U.S. clearly began to bear less responsibility for the total amount given.} While Portugal formerly colonized Mozambique---making it a plausible contender for lead donor given the role of colonial legacy in driving aid giving [@chibaHeinrich2019]---it only held top-donor status in 1997 and again in 1999 and 2000.
+
+The United States arguably qualifies as a lead donor in the first case (Mexico), while no obvious lead donor exists in the second (Mozambique). Of course, not all cases can be categorized so decisively. The question of where to draw the line is unavoidably subjective and arbitrary, which poses a challenge to setting down criteria for lead donorship. Thankfully, prior research points to helpful metrics and benchmarks.
+
+One such metric is donor concentration, which captures the degree to which the supply of aid given to a recipient comes from concentrated or diffuse sources. The Herfindahl index (HI) is the most commonly applied such measure in the aid literature [see @djankovEtAl2009; @gehringEtAl2017; @knackRahman2007; @steinwand2015], and for good reason. HI has a simple formulation and intuitive interpretation. With respect to a recipient $j$ in year $t$ HI is given as
+$$\text{HI}_{jt} = \sum_{i = 1}^N \pi_{ijt}^2, \tag{1}$$
+where $\pi_{ijt}$ is the share of aid given to recipient $j$ in year $t$ that donor $i$ is responsible for. The final measure is equal to the probability that two randomly drawn dollars from the overall aid given to a recipient in a given year come from the same donor. The higher this probability, the more concentrated the donor pool.
+
+However, while HI offers simplicity and interpretability, it lacks specificity. While it summarizes how concentrated donorship to a recipient is, it does not reveal which donor, or set of donors, bears responsibility for the greatest share.
+
+Alternatives to this measure exist that have their own strengths and weaknesses. @gehringEtAl2017 summarize some, including a class of indices called concentration ratios (CR) and a simple count of the number of donors giving aid to a recipient in a given year. The latter is straightforward and the simplest of all the measures. But, the cost of this simplicity is an inability to distinguish between a case where, say, 10 donors give aid to a recipient but one gives 50 percent of the total supply and a case where 10 donors give aid in equal proportion to each other. 
+
+The former, CR, has the benefit of capturing aid shares with respect to a top donor or set of donors, but it does require some user discretion in how the ratios are defined. CR entails summing up the shares of aid contributed by a set of the largest donors. However, whether this set should consist of only the top donor or top five, there is no objectively correct answer. Further, depending on the overall distribution of aid shares across donors, CR can provide very different answers about the degree of donor concentration depending on how many donors are factored into the equation. That said, CR does provide specificity with respect to the top donor or set of donors giving aid, which cannot be said for the other measures.
+
+Given the pros and cons of these indices, it is no surprise that @steinwand2015, who provides the first set of empirical criteria for identifying a lead donor, uses a mix of measures to take advantage of their strengths while overcoming their weaknesses. In particular, Steinwand codes lead donorship as present when:
+
+\bigskip
+
+  1. The HI for a given recipient in a given year is greater than the median HI for the data sample;
+  2. The difference between the total amount of aid given by the top donor relative to the next largest donor to a recipient in a year is greater than the sample median of this difference;
+  3. The share of aid to a recipient in a given year from the top donor is greater than the sample median of aid shares.
+  
+\bigskip  
+  
+This measure takes into account not only the degree of donor concentration, but also the absolute and relative amount of aid given to a recipient from the top donor. To further capture the temporal dynamic of lead donorship, @steinwand2015 adds the following longitudinal criteria:
+
+\bigskip
+
+  4. A donor must have top donor status for at least 5 out of 9 consecutive years;
+  5. A donor must not drop from top donor status for more than 2 consecutive years in that 9 year time span.
+
+\bigskip
+
+In devising a measure of lead donorship for this study, I adopt some, but not all, of these decision rules. In particular, I rely on the first three while I opt for a slightly more flexible approach to deal with the longitudinal dimension of lead donorship. Instead of the year-based criteria, I use a simple lagged rolling average of lead donorship:
+
+\bigskip
+
+> *For a given year, I calculate the proportion of times a donor meets the criteria specified in points 1-3 in that year and the two previous.*
+
+\bigskip
+
+With this approach, if a donor met criteria 1-3 in 1999 and 2000, but fell short in 2001, its lead donor status would be 2/3 in 2001. This strategy adds a fuzziness to lead donorship that Steinwand's measure lacks. Rather than being entirely present or absent, lead donorship may wax and wane with a certain degree of granularity.
+
+This choice has a practical, in addition to metrological, purpose. Namely, it helps me to avoid having to drop the first nine years from my panel dataset in order to construct a valid measure. By Steinwand's longitudinal criteria, no observations in the first nine years of the the CRS panel I am using would be coded as lead donor, making them unusable in analysis---a significant loss of data. In contrast, by basing lead donorship on a three-year lagged running average, I only have to drop the first two years.
+
+These selected cut-offs (sample medians and number of years) is unavoidably arbitrary, but it does a fair job of identifying cases where, on its face, lead donorship is present. Consider again the aid recipients Mexico and Mozambique. Figure 2 reports the aid shares of the top donors to each recipient per year from 1998 to 2014---1996 and 1997 now have to be dropped. In addition, it reports the lead donorship status of the top aid donors by the column shades. The darker the shade, the stronger the measure of lead donorship.
+
+```{r, fig.height=4, fig.width=10, fig.cap="Lead donorship of top donors to Mexico and Mozambique."}
+dt <- filter(dt, year > 1997)
+dt %>%
+  mutate(
+    donor_code = countrycode::countrycode(
+      donor, "country.name", "iso3c"
+    )
+  ) %>%
+  filter(
+    recipient %in% c("Mexico", "Mozambique")
+  ) %>%
+  group_by(recipient, year) %>%
+  transmute(
+    donor_code = donor_code,
+    lead_donor = lead_donor,
+    aid_share = aid / sum(aid),
+    aid_1st = aid_share == sort(aid_share, decreasing = T)[1]
+  ) %>%
+  filter(
+    aid_1st
+  ) %>%
+  ungroup %>%
+  mutate(
+    lead_donor = case_when(
+      lead_donor == 0 ~ "0",
+      lead_donor == 1/3 ~ "1/3",
+      lead_donor == 2/3 ~ "2/3",
+      TRUE ~ "1"
+    ) %>%
+      factor(
+        levels = c("0", "1/3", "2/3", "1")
+      )
+  ) -> plt_dt
+
+ggplot(plt_dt) +
+  aes(year, aid_share, label = donor_code,
+      fill = lead_donor) +
+  geom_col() +
+  geom_text(vjust = .5, hjust = 1, angle = 90,
+            color = "white", fontface = "bold") +
+  geom_text(
+    aes(label = round(aid_share*100)),
+    vjust = -.5
+  ) +
+  facet_wrap(~ recipient) + 
+  scale_x_continuous(
+    breaks = 1998:2014
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1)
+  ) +
+  scale_fill_grey(start = .85, end = 0) +
+  labs(
+    x = NULL,
+    y = "Aid Share",
+    fill = "Lead Donorship"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, hjust = 1
+    ),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    legend.position = c(0.9, 0.75),
+    legend.background = element_rect(color = "black")
+  ) 
+```
+
+As it turns out, the measurement strategy does a fair job of identifying lead donorship. In the case of Mexico, the leadership of the United States is strongest precisely when it should be, based on its giving. Further, when its giving wanes, this is reflected in the U.S. having a weaker measure of lead donorship or even being supplanted by other donors in a few years. Japan, for example has a modest degree of lead donorship in 1998 and 2000 (1/3), as does France in 2012 (1/3). Even so, as we would intuitively expect, the United States has non-zero lead donorship status for 12 of the 17 years from 1998 to 2014 and has full lead donorship status from 2003 to 2006 and again in 2010.
+
+Conversely, no donor rises to even a modest level of lead donorship status in Mozambique for the entire period from 1998 to 2014. Even from 2008 to 2014 when the U.S. consistently holds the position of top donor, its level of giving is insufficient to earn it the lead donorship title. This is as would be expected given the historical widespread attention Mozambique receives from the donor community. In such a fragmented donor environment, lead donorship remains elusive.
+
+
+# Where and Why Does Lead Donorship Emerge?
+
+We have a conceptual and empirical classification of lead donorship, and we have a sense for its material importance for international development. That leaves only the question of when, where, and why lead donorship emerges. What kinds of recipients have a greater probability of having a lead donor? Which donors have a greater probability of holding lead donor status?
+
+Two sets of donor goals have relevance in answering these questions. The first set of goals consists of objectives that yield common benefits for donors. These include economic development and promoting political stability [@bermeo2017; @bermeo2018]. The second consists of rival objectives where one donor's gain comes at a cost to others. These include policy alignment, trade, influence over former colonies, prestige, and geostrategic considerations [@bearceTirone2010; @kilbyDreher2010; @kisanganiPickering2015; @roundOdedokun2004; and @vanDerVeen2011].
+
+@steinwand2015 provides one account for how these goals relate to lead donorship. He enumerates four scenarios, two per each basket of goals. In the case of common benefits, a lead donor emerges due to uncoordinated activity, while cooperation reduces the likelihood of single donor leadership. Conversely, in the case of rival goals, lead donorship emerges as a consequence of collusion, while uncoordinated competition for rival goals precludes lead donorship. 
+
+Though compelling, this account remains untested and is somewhat problematic. While @steinwand2015 uses lead donorship as a key explanatory variable that conditions donor responses to peer aid, the factors that give rise to it remain a matter of speculation. In addition, the fact that cooperation is a key explanatory variable in this account is problematic for two reasons. First, material evidence of cooperation remains elusive. @gehringEtAl2017 provide a helpful discussion on this issue. To summarize, the chief concern in capturing cooperation is that it lacks a formal measure. Neither donors nor international organizations provide a database of donor cooperation, and transparency from donors is limited. Though some indirect measures exist, they have features that make it difficult to disentangle their relationship with cooperation from other effects. 
+
+Second, the consensus among policymakers and scholars to date is that international development remains a quagmire of cooperation failure. @fuchsEtAl2015 cite several instances where, time after time, high level summits yield dismal progress on their established benchmarks for cooperation. The fact that the donor community bears a facade of frustration over the issue is telling. Tangentially, the purported systemic failure of cooperative efforts might explain the dearth of reliable measures of cooperation---it is hard to devise a measure for something that hardly exists.
+
+
+\begin{table}[!t]
+\centering
+\caption{Where does lead donorship emerge?}
+\vspace*{5mm}
+\begin{tabular}{c|cccc}
+
+  && Low Comparative Interest && High Comparative Interest \\
+\hline
+ High Need && \textit{None} && \textbf{Lead Donor} \\
+           &&               && \\
+ Low Need  && \textit{None} && \textit{None} \\
+\hline
+\end{tabular}
+\end{table}
+
+An explanation of what drives lead donorship, therefore, must rest on the assumption that donor governments behave in decidedly uncooperative ways. Rather than the product of collusion in the face of rivalry, or of self-interested deference in the face of collective benefits, lead donorship should arise in a purely uncoordinated general equilibrium among donors. 
+
+So, under what conditions would lead donorship align with the individual incentives of donor governments? This question has a fairly straightforward answer. Donor governments pursue a mix of rival and common goals in aid recipients, and the types of goals that predominate in donor-recipient relationships will vary across cases. When and where rival goals have greater salience, donors should compete. Conversely, when and where common goals have greater salience, donors will have incentives to pass the buck to the extent others bear responsibility for funding aid projects. The pattern of donor responses across recipients should, in turn, ultimately shape when and where lead donorship emerges. On the basis of prior theory and some reasonable assumptions, I argue specifically that lead donorship should arise with greatest frequency in *high need* developing countries where a donor government has *outsized non-development foreign policy interests* relative to other donors. The following logic predicates this prediction.
+
+On the one hand, donor governments can use foreign aid as a "bribe" to leverage desired diplomatic, material, or strategic actions or concessions from recipient governments [@buenoDeMesquitaSmith2009]. The value of such concessions will vary between recipients but will have greatest significance when and where donor's non-development foreign policy interests are strongest---e.g., in major trading partners, geographically proximate recipients, former colonies, and treaty allies. 
+
+However, donor interest alone does not tell the full story. Recipients with greater need will be preferred targets for aid-for-policy deals; not necessarily because donors seek to address recipient needs, but because greater need gives donor governments more leverage to make policy concessions incentive compatible for recipient governments [@buenoDeMesquitaSmith2009]. Further, formal analysis by @bermeo2018 suggests development need may in fact complement non-development goals, meaning that interest in promoting development actually enhances the value of political, economic, or strategic concessions. Thus, in high need recipients donors have the most to gain or lose when their foreign policy interests are in play.
+
+Importantly, the concessions donors get in exchange for aid may not always have collective benefits for the donor community. Even among DAC members, governments have conflicting goals, and anecdotes abound of donors complaining about their muted influence in the presence of other-donor aid [@steinwand2015]. Thus, it is plausible that recipient need and donor interest will coincide with the deepest rivalry in objectives for donor governments---and, therefore, will characterize the sites of stiffest donor competition.
+
+On the other hand, aid-for-policy exchange does not preclude interest in development. Political leaders of industrialized countries time and again stress the link between poverty and political instability abroad and problems at home [@bermeo2017; @bermeo2018]. Though in instances where foreign policy interests are most acute, development promotion may take a back seat, donors will have an interest in international development when and where strategic goals have less salience. As some of the studies cited above show, aid from donors has a greater likelihood of mapping to positive development outcomes for recipients when and where donors' strategic interests are less important [@bearceTirone2010; @girod2012]. 
+
+Development promotion, unlike material and strategic concessions, may produce collective benefits for the donor community, regardless of which donor allocates aid. This gives donors an incentive to defer on some or all of the responsibility for giving aid to the extent that other donors give more---especially in recipients where the depth of need is most serious. Strategic deference, or buck-passing, serves an economizing role. As other donors give more aid, this allows a single donor to target resources elsewhere.
+
+Taken together, these strategic dynamics have clear implications for lead donorship. For convenience, Table 1 summarizes where lead donorship is predicted to emerge. A donor has the greatest likelihood of holding lead donor status in a high need developing country where that donor has the strongest foreign policy interest compared to others. The confluence of these two factors (high need and high comparative interest) characterize the right set of conditions for one donor to have greatest incentive to dominate in its relationship with a recipient while others have greatest incentive to show deference as they reap benefits from the aid of the top donor without incurring losses to their non-development foreign policy goals.
+
+
+# Data and Methods
+
+The above discussion provides clear and observable predictions for when and where lead donorship emerges. As donors seek to maximize their wide-ranging foreign policy goals through their aid allocation, lead donorship emerges in an uncoordinated general equilibrium among donor governments. Specifically, a donor has the greatest likelihood of leading in high need recipients where said donor has greatest comparative foreign policy interest relative to other donors.
+
+To test this prediction I use the measure of lead donorship as previously defined using panel time-series data on ODA commitments from 29 DAC countries across 24 aid sectors to more than 120 aid recipients from 1998 to 2014. To reiterate, lead donorship is coded as the average number of years (from $t-2$ to $t$) where
+
+\bigskip
+
+  1. In a recipient the HI (measure of donor concentration) for a given recipient in a given year is greater than the median HI for the data sample;
+  2. The difference between the total amount of aid given by the top donor relative to the next largest donor to a recipient in a year is greater than the sample median of this difference;
+  3. The share of aid to a recipient in a given year from the top donor is greater than the sample median of aid shares.
+  
+\bigskip  
+
+Figure 3 reports how the yearly average of lead donorship within aid recipients compares to the yearly average of HI. Interestingly, while HI---which measures the probability that two randomly drawn dollars of aid given to a recipient originate from the same donor---slightly declined from 1998 to 2014, lead donorship saw a relatively steady increase in recipients over this same period. This pattern runs counter to that reported by @steinwand2015. Though he summarizes lead donorship over a slightly different period, 1970 to 2010, even for the years that overlap with the results presented here, we identify opposite trends in lead donorship.
+
+
+```{r}
+# Define lead donorship by recipient:
+dt <- dt %>%
+  group_by(recipient, year) %>%
+  mutate(HI = sum(aid_share^2)) %>%
+  ungroup
+dt %>%
+  group_by(recipient, year) %>%
+  summarize(
+    lead_donor = max(lead_donor),
+    HI = mean(HI)
+  ) %>%
+  group_by(year) %>%
+  summarize(
+    lead_donor = mean(lead_donor),
+    HI = mean(HI)
+  ) -> year_dt
+```
+
+
+```{r, fig.height=3.75, fig.width=5, fig.cap="Values computed using the giving of 29 DAC countries across 24 development sectors to 127 recipient countries."}
+year_dt %>%
+  rename(
+    "Lead Donorship" = lead_donor
+  ) %>%
+  ungroup %>%
+  pivot_longer(
+    cols = c(HI, `Lead Donorship`)
+  ) %>%
+  ggplot() +
+  aes(
+    x = year,
+    y = value,
+    linetype = name
+  ) +
+  geom_line(size = 0.75) +
+  scale_x_continuous(
+    n.breaks = 10
+  ) +
+  labs(
+    x = "Year",
+    y = "Yearly Average per Recipient",
+    linetype = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = c(0.8, 0.9)
+  )
+```
+
+
+Part of the incongruence between these results lies in the choice of aid variable. While @steinwand2015 uses aid disbursements, I use aid commitments. The former often closely reflects the latter but often with varying lags since commitments most closely match immediate changes in donor policy while disbursements represent downstream realizations of that policy over time. In a given year, Germany may commit a certain amount of aid to Indonesia, but that aid may be disbursed in installments over several years, for instance.
+
+An additional difference is my choice to use the OECD's Creditor Reporting System (CRS) to isolate aid dollars committed specifically toward the 24 development sectors defined by the OECD. The total package of aid donors give often includes funds for overhead, staffing, administration, etc. I exclude such costs since they can be highly idiosyncratic to donors and across recipients and do not capture the types of budget support, debt relief, and sector-specific resources that have greatest material relevance for recipient outcomes. That @steinwand2015 observes a decline in lead donorship over time may follow from the inclusion of overhead in aid totals---which will have increased across donors over time as aid agencies and start-up costs for projects grow. Including these funds, then, may have obscured the degree to which lead donorship across development sectors has, in fact, increased over time.
+
+Donor interest (DI) and recipient need (RN) are the key explanatory variables for lead donorship. DI and RN are composite measures that capture variation in the strength of donors' foreign policy interests and the depth of recipient need for aid, respectively. RN is comprised of the following variables, each measured at the level of aid recipients:
+
+\bigskip
+
+  - yearly per capita gross domestic product (GDP);
+  - yearly population size;
+  - the yearly number of individuals killed due to natural disasters;
+  - an indicator for whether the recipient is experiencing a civil war in a given year;
+  - the yearly level of political and civil liberties of a recipient.
+  
+\bigskip
+  
+The first two measures come from the Penn World Table (version 9.1) and were log-transformed to normalize values. The severity of natural disasters in a given year comes from the Institute of Health Metrics and Evaluation's database on natural disaster deaths reported by countries in a given year. Values are transformed via the inverse hyperbolic sine (ihs) transformation to preserve zero values. The indicator for civil war comes from the UCDP/PRIO armed conflict database and takes the value 1 for all years where there was a violent conflict between at least two parties that involved the deaths of at least 25 combatants and which included the government as at least one of the parties in the conflict. The final measure, recipient civil and political liberties, is the sum of the Freedom House's political rights and civil liberties scores for a given recipient country in a given year. The rights and liberties scores each range from 1 to 7, with higher values denoting more violations. After summing the values, the scores were reversed so that higher values denote greater freedom.
+
+DI was constructed from the following four variables:
+
+\bigskip
+
+  - bilateral distance (in kilometers) between a donor and a recipient;
+  - bilateral trade (in dollars) between a donor and a recipient;
+  - an indicator for whether the donor and recipient are formal allies;
+  - an indicator for whether the donor and recipient share a colonial past.
+  
+\bigskip
+  
+Distance comes from CEPII's gravity dataset, and trade comes from CEPII's TRADEHIST dataset. The former is log-transformed, while the latter is transformed via ihs. The alliance measure comes from the ATOP database and takes the value 1 if the donor and recipient share a formal treaty alliance. The colony measure comes from the same CEPII dataset as the bilateral distance measure, and takes the value 1 if the donor was a former colonizer of the recipient.
+
+To construct DI and RN, I use an algorithm based on other common techniques of feature projection. The goal of the algorithm is to construct a continuous measure that is optimized to covary as much as possible with any single component measure without detracting too much from its covariance with any one of the other component measures. Specifically, for each component variable $x_{ik}$ with $i = 1, ..., n$ observations for $k = 1,...,m$ variables, the algorithm identifies a set of parameters $\omega = (\omega_1,...,\omega_m) \in \mathbb{R}^m$ that maximize
+$$\sum_{k = 1}^m \text{cov}(x_{ik}, z_i)^2, \tag{2}$$
+where $z_i$ is the linear combination of the $m$ variables:
+$$z_i = \sum_{k=1}^m \omega_k x_{ik}.\tag{3}$$
+To help ensure that variables are on a comparable scale, each is mean-centered and transformed to have standard deviation of 1---even the binary measures. The resulting linear combination $z_i$ is again mean-centered and transformed to have standard deviation of 1. 
+
+It can be helpful to think of this approach as generating a weighted index from component measures, where the algorithm identifies the appropriate weights, and the most appropriate sign, to give to each component. The resulting composites capture much, though of course not all, of the information contained in the individual variables used to construct them. Even so, these measures perform well as predictors of aid allocation, and their covariance with their component measures is largely consistent with the direction of each separate measure's relationship with aid allocation.^[Relevant results are provided in the Appendix of a previous chapter of this dissertation.]
+
+I apply a final transformation to DI. Because *relative* donor interest has greatest theoretical importance, I specify in a given year for a given recipient:
+$$\tilde{\text{DI}}_{ijt} = \frac{\text{DI}_{ijt} - \min_{jt} \left(\text{DI}_{ijt}\right)}{\sum_{i} \left[\text{DI}_{ijt} - \min_{jt} \left(\text{DI}_{ijt}\right) \right]}. \tag{4}$$
+The resulting measure denotes a donor $i$'s comparative share of foreign policy interest in a recipient in a given year relative to other donors.
+
+Finally, in the construction of both measures, time-varying covariates (except for natural disaster deaths) are lagged by one year to account for possible endogeneity between them and lead donorship.
+
+Using the above measures, to test the prediction that lead donorship emerges at the confluence of high need and high comparative donor interest, I specify lead donorship as a multiplicative function of $\text{RN}_{jt}$ and $\tilde{\text{DI}}_{ijt}$:
+$$\text{Lead Donor}_{ijt} = \beta_1 \text{RN}_{jt} + \beta_2 \tilde{\text{DI}}_{ijt} + \beta_3 \text{RN}_{jt} \times \tilde{\text{DI}}_{ijt} + \delta_i + \gamma_t + \varepsilon_{ijt}. \tag{5}$$
+The terms $\delta_i$ and $\gamma_i$ denote donor and year intercepts, respectively, to account for unobserved donor characteristics and yearly shocks.
+
+There are several justifiable ways to estimate this model given the fractional, and thus bounded, nature of the outcome. Here I opt for fractional logit which specifies the outcome in log-odds, thus transforming the bounded fractional response into an unbounded one. The one major limitation with this approach is that it imposes strong iid assumptions about the error term---heroic in any context involving panel-time series data. A common fix in this situation is to use the gradients of the Jacobian to compute cluster-robust standard errors; though, this does not correct for bias in the parameter estimates themselves since in a logit model the variance is part of the identity of the parameters. A better approach is a mixed effects fractional logit model that includes random intercepts for donor-recipient pairs (dyads). This permits explicitly modeling heterogeneity and dyadic dependence in the data, ensuring reduced bias in the parameter estimates and more efficient standard errors (assuming the model has been correctly specified).
+
+In the Appendix I include estimates from two alternative approaches---a linear fractional model and a log-odds transformed linear model, both estimated via OLS---as a robustness check against the possibility that the findings presented in the next section result from a particular pathology of the mixed effects fractional logit. As the results shown their illustrate, estimates from these alternative approaches are consistent with those presented for the main analysis.
+
+
+# Results
+
+So what does the analysis reveal? Regression estimates are shown in Table 2. Column 1 shows results estimated using the entire data sample, and column 2 shows results limiting the sample to only donors that have ever held lead donor status (more on this later). The first regression was estimated using a total of `r scales::comma(nrow(dt))` dyad-year observations, composed of `r length(unique(dt$donor))` donors and `r length(unique(dt$recipient))` recipients, which comprise `r scales::comma(length(unique(dt$dyad)))` unique dyads. For reference, the Appendix includes summary statistics.
+
+```{r}
+dt %>%
+  group_by(donor, recipient) %>%
+  summarize(
+    lead_donor_sw = mean(lead_donor),
+    lead_donor_al = sum(HI * top_donor) / sum(HI),
+    aid_share = mean(aid_share),
+    HI = mean(HI),
+    ties = mean(ties),
+    ties_share = mean(ties_share),
+    need = mean(need),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    
+    # mean center for interpretation 
+    ties_share_cen = ties_share - mean(ties_share),
+    need_cen = need - mean(need),
+    
+    # proposed transformations of the outcome
+    lead_donor_cen_sw = case_when(
+      lead_donor_sw == 0 ~ 0.001,
+      lead_donor_sw == 1 ~ 0.999,
+      TRUE ~ lead_donor_sw
+    ),
+    lead_donor_cen_al = case_when(
+      lead_donor_al == 0 ~ 0.001,
+      lead_donor_al == 1 ~ 0.999,
+      TRUE ~ lead_donor_al
+    ),
+    log_lead_donor_sw = log(lead_donor_cen_sw / (1 - lead_donor_cen_sw)),
+    log_lead_donor_al = log(lead_donor_cen_al / (1 - lead_donor_cen_al))
+  ) -> avg_data
+```
+
+
+```{r}
+log_it <- function(x) {
+  x <- (x == 0) * 0.001 + x - (x == 1) * 0.001
+  log(x / (1 - x))
+}
+dt %>%
+  mutate(
+    log_lead_donor = log_it(lead_donor),
+    num_dyad = as.numeric(as.factor(dyad))
+  ) -> dt
+```
+
+
+```{r}
+lm_robust(
+  lead_donor ~ ties_share * need,
+  fixed_effects = ~ donor + year,
+  data = dt,
+  clusters = dyad,
+  se_type = "stata"
+) -> fit1
+lm_robust(
+  log_lead_donor ~ ties_share * need,
+  fixed_effects = ~ donor + year,
+  data = dt,
+  clusters = dyad,
+  se_type = "stata"
+) -> fit2
+gam(
+  lead_donor ~ ties_share * need + donor + year +
+    s(num_dyad, bs = "re"),
+  data = dt %>% mutate(year = as.factor(year)),
+  family = binomial,
+  method = "REML"
+) -> fit3
+lm(
+  lead_donor ~ ties_share * need + donor + year,
+  dt %>% mutate(year = as.factor(year))
+) -> predfit1
+lm(
+  log_lead_donor ~ ties_share * need + donor + year,
+  dt %>% mutate(year = as.factor(year))
+) -> predfit2
+fit3 -> 
+  predfit3
+```
+
+```{r}
+dt %>%
+  filter(year >= 1998) %>%
+  group_by(donor) %>%
+  mutate(
+    ever_lead_donor = mean(lead_donor)>0
+  ) %>%
+  filter(ever_lead_donor) -> small_dt
+```
+
+```{r}
+lm_robust(
+  lead_donor ~ ties_share * need,
+  fixed_effects = ~ donor + year,
+  data = small_dt,
+  clusters = dyad,
+  se_type = "stata"
+) -> fit1.small
+lm_robust(
+  log_lead_donor ~ ties_share * need,
+  fixed_effects = ~ donor + year,
+  data = small_dt,
+  clusters = dyad,
+  se_type = "stata"
+) -> fit2.small
+gam(
+  lead_donor ~ ties_share * need + donor + year +
+    s(num_dyad, bs = "re"),
+  data = small_dt %>% mutate(year = as.factor(year)),
+  family = binomial,
+  method = "REML"
+) -> fit3.small
+lm(
+  lead_donor ~ ties_share * need + donor + year,
+  small_dt %>% mutate(year = as.factor(year))
+) -> predfit1.small
+lm(
+  log_lead_donor ~ ties_share * need + donor + year,
+  small_dt %>% mutate(year = as.factor(year))
+) -> predfit2.small
+fit3 -> 
+  predfit3.small
+```
+
+
+```{r, results='asis'}
+texreg(
+  list("Full Sample" = fit3, "Only Lead Donors" = fit3.small),
+  include.ci = F,
+  custom.coef.map = list(
+    "ties_share" = "$\\tilde{\\mbox{DI}}_{ijt}$",
+    "need" = "$\\mbox{RN}_{jt}$",
+    "ties_share:need" = "$\\mbox{RN}_{jt} \\times \\tilde{\\mbox{DI}}_{ijt}$"
+  ),
+  custom.header = list(
+    "(1)" = 1,
+    "(2)" = 2
+  ),
+  caption = "Mixed Effect Fractional Logit Estimates",
+  caption.above = T,
+  custom.gof.rows = list(
+    "Donor FE" = rep("Yes", len = 2),
+    "Year FE" = rep("Yes", len = 2),
+    "Dyad RE" = rep("Yes", len = 2),
+    "N" = c(scales::comma(nrow(dt)), 
+            scales::comma(nrow(small_dt))),
+    "Dyads" = c(scales::comma(length(unique(dt$dyad))),
+                scales::comma(length(unique(small_dt$dyad))))
+  ),
+  include.rmse = F,
+  include.rsquared = F,
+  include.aic = F,
+  include.bic = F,
+  include.log = F,
+  include.deviance = F,
+  include.dispersion = F,
+  include.gcv = F,
+  include.nsmooth = F,
+  include.nobs = F,
+  include.nclusts = F
+)
+```
+
+Direct interpretation of estimates from an interaction model is a difficult exercise, even more so for models where the outcome is given in log-odds. However, inspection of the output provides some intuition about the patterns in the data. The estimate for the main term for DI share indicates that, holding RN constant at zero (this is equivalent to the sample mean based on RN's construction) a unit increase DI share is associated with a 8.74 change in the log-odds of lead donorship. Conversely, holding DI share constant at zero, a unit increase in RN is associated with a $-0.07$ decline in the log-odds of lead donorship; though this result falls short of the conventional level for statistical significance.
+
+Most important for the prediction that lead donorship arises at the confluence of high comparative donor interest and high recipient need, the interaction term for DI share and RN is positive and statistically significant at the $p < 0.001$ level. These raw estimates, however, do not do justice to what these models tell us about the pattern of lead donorship in the data. Generating predictions will provide some much needed clarity.
+
+Figure 4 shows predictions generated by the model shown in column 1. Because the specification included donor and year fixed effects and random dyadic effects, it was necessary to select a discrete value for each when generating predictions. For this particular set, I have fixed the donor as the United States, the year to 2005, and the dyad to US-Malawi. This choice is purely illustrative, and different selections do not significantly alter the predictions. The results offer clear support for the prediction that lead donorship emerges at the confluence of high comparative donor interest and high recipient need.
+
+
+```{r, fig.height=3.75, fig.width=4, fig.cap="Predicted level of lead donorship status in a recipient for a given donor. Results shown for United States in 2005 to illustrate. Prdictions for each of the models shown in the order they appear in Table 2."}
+list(
+  predfit3
+) -> predfits
+1:length(predfits) %>%
+  map(
+    ~ {expand.grid(ties_share = seq(from = 0, to = 1, len = 20), 
+                        need = seq(from = -2, to = 2, len = 20),
+                        donor = "United States",
+                        year = "2005",
+                        num_dyad = 3794) %>%
+      mutate(id = 1:n()) -> newdata
+      mutate(
+        newdata,
+        ll = predict(predfits[[.]], newdata = newdata),
+        expll = exp(ll) / (1 + exp(ll))
+      ) -> preddata
+      xtabs(expll ~ ties_share + need, data = preddata)}
+  ) -> xtb
+
+par(
+  mar = c(1,1,1,1) + 0.1,
+  mfrow = c(1, 1)
+)
+for(i in 1:length(xtb)) {
+  persp(
+        x = as.numeric(colnames(xtb[[i]])),
+        y = as.numeric(rownames(xtb[[i]])),
+        z = xtb[[i]],
+        xlab = "Need",
+        ylab = "Interest",
+        zlab = "Lead Donor",
+        theta = 40, phi = 40,
+        col = "lightgrey",
+        ltheta = 30, lphi = 30,
+        shade = 0.25
+      )
+}
+```
+
+
+
+
+```{r, fig.height=6, fig.width=4, fig.cap="Who leads most frequently?"}
+lm_robust(
+  lead_donor ~ donor - 1,
+  data = dt,
+  se_type = "stata",
+  clusters = dyad
+) %>%
+  tidy() %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  filter(
+    stringr::str_detect(term, "donor")
+  ) %>%
+  mutate(
+    term = stringr::str_remove(term, "donor")
+  ) -> plt_dt
+ggplot(plt_dt) +
+  aes(
+    estimate,
+    reorder(term, estimate),
+    xmin = conf.low,
+    xmax = conf.high
+  ) +
+  geom_col() +
+  geom_errorbarh(height = 0.1) +
+  geom_vline(xintercept = 0, lty = 2) +
+  labs(
+    x = "Yearly Average of Lead Donorship Strength",
+    y = NULL,
+    caption = "cluster-robust 95% CIs shown"
+  )
+```
+
+
+```{r, fig.height=4, fig.width=6, fig.cap="Donors with larger economies have a greater likelihood of holding lead donor status."}
+dt %>%
+  group_by(donor) %>%
+  summarize(
+    gdp = mean(donor_gdp)
+  ) %>%
+  left_join(
+    .,
+    plt_dt,
+    by = c("donor" = "term")
+  ) -> plt_dt
+rsq <- summary(lm(estimate ~ gdp + I(gdp^2), plt_dt))$r.squared
+ggplot(plt_dt) +
+  aes(
+    gdp,
+    estimate
+  ) +
+  geom_smooth(
+    se = F,
+    method = "lm",
+    formula = y ~ x + I(x^2),
+    color = "darkgrey"
+  ) +
+  geom_point() +
+  annotate(
+    "text",
+    x = 10000000,
+    y = 0.02,
+    label = paste0("R^2==", round(rsq, 2)),
+    parse = T
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 15, by = 2) * 1000000,
+    labels = seq(0, 15, by = 2)
+  ) +
+  labs(
+    x = "Average donor GDP (1998-2014) in trillions ($)",
+    y = "Average strength of lead donorship",
+    caption = "Regression line fit with a second order polynomial."
+  ) 
+```
+
+
+```{r, fig.height=4.75, fig.width=6, fig.cap="Years where a donor is coded as having non-zero lead donorship in at least one recipient."}
+dt %>%
+  filter(year >= 1998) %>%
+  group_by(donor, year) %>%
+  summarize(
+    lead_donor = mean(lead_donor),
+    gdp = mean(donor_gdp)
+  ) %>%
+  mutate(
+    lead_donor = ifelse(lead_donor == 0, "No", "Yes") 
+  ) %>%
+  group_by(donor) %>%
+  mutate(
+    gdp = mean(gdp)
+  ) %>%
+  ggplot() +
+  aes(
+    year,
+    reorder(donor, gdp),
+    fill = lead_donor
+  ) +
+  geom_tile(color = "grey") +
+  scale_fill_manual(
+    values = c("white", "black")
+  ) +
+  scale_x_continuous(
+    breaks = 1998:2014,
+    position = "top"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Any instance of lead donorship?"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 0),
+    panel.grid = element_blank()
+  )
+```
+
+Beyond donor interest and recipient need, the data provides an opportunity to explore other patterns in lead donorship, namely, which donors have the greatest propensity to hold lead donor status on average. Figure 5 reports the average strength of lead donorship status by donor for the 1998-2014 period. The United States most often holds lead donor status in recipients. This comes as little surprise. In terms of total ODA, the U.S. regularly outpaces other donors in absolute spending. This gives it an advantage in rising to the top when and where its foreign policy interests are strongest, both in absolute and comparative terms. Japan historically has come in second in terms of ODA spending, so it follows that the frequency with which it holds lead donor status is second only to the U.S. France comes in third, followed by Germany, the United Kingdom, and the Netherlands.
+
+This pattern correlates quite cleanly with donors' available resources. Figure 6 plots the average strength of lead donorship per donor over its average gross domestic product (GDP) from 1998 to 2014.^[Donor GDP was computed using data from version 9.1 of the Penn World Table.] A clear relationship exists between GDP and frequency of lead donorship. Clearly, in addition to comparative foreign policy interest and depth of recipient need for aid, the ability of donor governments to marshal resources plays a substantial role.
+
+It also bears noting that a number of donor governments never actually achieve non-zero lead donor status. Figure 7 brings this fact into sharper relief by using a donor by year grid to indicate years where a donor has non-zero lead donor status in at least one recipient. The donors are in descending ordered by their average GDP from 1998 to 2014. While larger donors---the U.S., the U.K., Japan, Germany, and France---stand out for their enduring leadership, many other donors never approach such a level of dominance in any recipient country. In a list that includes Austria, Canada, Finland, and Switzerland, `r sum(plt_dt$estimate==0)` of the donors in the sample never achieve non-zero lead donorship.
+
+This fact, in addition to being normatively interesting, points to a number of donors in the dataset that provide no variation in the dependent variable. The largest donors, therefore, are the ones driving the main results. Indeed, the output from the analysis changes little if the analytical sample is restricted to only those donors that ever achieve lead donorship. Column 2 of Table 2 reports regression estimates generated only using the sample of donors that have non-zero lead donorship in at least one year. With rounding, the estimates are identical to those reported in column 1.
+
+The existence of never-lead-donors begs the question whether these smaller donors would behave *like* larger donors if given the resources to do so. It stands to reason that they would---why would they not? Unfortunately, there is no way to answer this question with the data.^[The lack of leadership among these donors could also be an artifact of the measurement strategy. Perhaps lead donorship as defined here is too restrictive and a less prohibitive measure would uncover more widespread leadership.]
+
+
+# Lead Donorship in Souteast Asia and South America
+
+The patterns identified in the previous analysis support the view that lead donorship follows from an uncoordinated general equilibrium among donor governments. A donor has the greatest likelihood of holding lead donor status in high need recipients where it has outsized foreign policy interests relative to other donors. The confluence of these two factors characterizes a set of conditions where one donor has the greatest incentive to dominate in its relationship with an aid recipient to maximize its non-development foreign policy interests, while others have the greatest incentive to show deference as they enjoy the development-promoting effects of aid from the lead donor without having to contribute as much or any aid themselves.
+
+Data, of course, are noisy. The sample collected for this analysis is no exception. Some error is to be expected, but as long as the overall average trends are calculated with a high level of statistical precision, this is no serious problem. However, it would be premature to write off all deviant cases as the product of random error. Sometimes, taking a closer look provides unanticipated qualitative insights. Perhaps additional mechanisms need to be considered, or maybe cases that on their surface are outliers are exceptions that prove the rule.
+
+@seawright2016 enumerates two useful criteria for selecting cases for qualitative examination. The first is deviant case selection. This approach involves identifying cases that deviate most substantively from their prediction given their values on explanatory variables of interest. As @seawright2016 notes, these cases provide an opportunity to, more narrowly, identify omitted variables and to, more broadly, find sources of measurement error in an outcome. Additionally, deviant cases provide a chance to identify new causal pathways that connect explanatory variables to a response.
+
+The second is "extreme-on-X" case selection. These are cases that have extreme values for an explanatory variable. @seawright2016 argues such cases represent "a powerful, underappreciated approach to choosing cases for in-depth analysis" (92). Extreme-on-X case selection can support the same objectives as selecting deviant cases, but from a slightly different angle---one that leverages the extremity of explanatory variables to consider other factors that make the case itself extreme.
+
+With these strategies in mind, in this section I take a closer look at lead donorship in two regions: Southeast Asia and South America. The first provides an opportunity to examine deviant cases. As will be summarized below, Japan stands out for its clear role as lead donor in this region. However, other donors---the United States and France---have comparative foreign policy interests in the region on par with, or that exceed, Japan's. So why does Japan dominate?
+
+The second case, South America, represents an extreme-on-X set of cases---specifically for comparative foreign policy interest. Relative to other donor governments, this region has outsized foreign policy importance for the United States. However, despite this, the U.S.'s dominance as lead donor is less prevalent than we would expect.
+
+In the first set of cases, examination of Japan's dominance reveals an important role for relative strength of foreign policy interests *within* donors. While the measure of donor interest (DI) share captures the importance of a recipient to one donor relative to others, it fails to characterize the importance of a recipient to a donor relative to its foreign policy priorities elsewhere. In the case of Southeast Asia, both France and the United States have interests nearly as strong or stronger than Japan's in absolute terms. However, compared to its other priorities, Japan's interests are heavily concentrated in Southeast Asia relative to other regions. At the same time, the U.S. and France have stronger foreign policy interests elsewhere. This suggests an additional dimension of donor interest that has relevance for lead donorship.
+
+The second set of cases highlight the role of other, unmeasured political and material forces at work in donors and recipients. Specifically, the lower-than-expected leadership by the U.S. in South America can be traced to economic conditions in the U.S., changes in recipient need in South America, and hostility by recipient governments toward U.S. economic assistance. At the same time, the factors that make the U.S. and exception help to prove the rule in other donors in the region. In response to changes in U.S. giving, the remaining top donors in the region respond as theory would predict given the strength of their foreign policy interests in the region.
+
+## Southeast Asia
+
+Japan has near unrivaled dominance in its foreign aid giving in Southeast Asia. While this will come as no surprise to many, on paper such unequaled leadership is not a foregone conclusion. Due to its colonial and economic ties with the region, France has strong interests in many of the countries in Southeast Asia. To a lesser extent, so does the United States. Though its priorities primarily lie in the Philippines, the United States has interests on par with Japan and France in Thailand as well. What explains Japan's unparalleled role as lead donor in the region?
+
+Aid recipients in Southeast Asia include Cambodia, Indonesia, Laos, Myanmar, the Philippines, Thailand, and Vietnam. According to the composite RN measure, each has above average need for aid. Figure 9 reports for these seven countries where their RN value falls in standard deviation units relative to the sample mean. This same metric is reported for the component measures of RN with poverty and political freedoms adjusted so that higher values indicate higher poverty and greater restrictions on liberty.
+
+While these countries have above average need for aid, they lack uniformity in the sources of this need. Indonesia has a large population, a disproportionately high loss of life from natural disasters, and a higher than average frequency of civil war years. At the same time, its poverty level falls just below the sample average, as does its limits on political and civil liberties. Laos, conversely, has near or slightly below average levels of poverty, population size, deaths from natural disasters, and incidence of civil war, while its citizens face comparatively more political and civil restrictions.
+
+```{r}
+f <- function(x) (x - min(x)) / sum(x - min(x))
+dt <- dt %>%
+  group_by(donor, year) %>%
+  mutate(
+    donor_ties_share = f(ties)
+  ) %>%
+  ungroup
+east_asia <- c("Cambodia", "Indonesia", "Myanmar", "Philippines",
+                     "Lao People's Democratic Republic", "Viet Nam",
+                     "Thailand")
+east_asia_donors <- c("Japan", "France", "United States")
+dt %>%
+  filter(
+    donor %in% east_asia_donors,
+    recipient %in% east_asia
+  ) -> east_asia_ts
+east_asia_ts %>%
+  group_by(donor, recipient) %>%
+  summarize(
+    aid = mean(aid),
+    aid_share = mean(aid_share),
+    ties = mean(ties),
+    need = mean(need),
+    ties_share = mean(ties_share),
+    donor_ties_share = mean(donor_ties_share),
+    donor_gdp = mean(donor_gdp),
+    lead_donor = mean(lead_donor)
+  ) -> east_asia_cs
+```
+
+
+
+```{r, fig.height=6, fig.width=6, fig.cap="Characterizing need in Southeast Asia relative to the sample."}
+dt %>%
+  mutate(fh = fh_total,
+         income = -log(income),
+         pop = log(pop),
+         disaster = asinh(disaster)) %>%
+  filter(
+    donor == "Japan"
+  ) %>%
+  mutate_if(
+    is.numeric,
+    ~ (.x - mean(.x)) / sd(.x)
+  ) %>%
+  group_by(recipient) %>%
+  summarize(
+    across(
+      c(need, income, pop, disaster, civilwar, fh),
+      list(
+        Mean = mean
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    recipient %in% east_asia
+  ) %>%
+  mutate(
+    recipient = ifelse(
+      str_detect(recipient, "Lao"),
+      "Laos",
+      recipient
+    )
+  ) %>%
+  pivot_longer(
+    2:ncol(.)
+  ) %>%
+  separate(
+    name, into = c("var", "stat"), sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>%
+  mutate(
+    var = rep(
+      c("Recipient Need", "Poverty", "Population", "Disaster Deaths", "Civil War", "Limits on Freedom"),
+      len = n()
+    ) %>%
+      as.factor() %>%
+      relevel(ref = "Recipient Need")
+  ) %>%
+  ggplot() +
+  aes(
+    x = Mean,
+    y = var
+  ) +
+  geom_vline(
+    xintercept = 0, lty = 2
+  ) +
+  geom_point(
+    color = "darkblue",
+    size = 3
+  ) +
+  facet_wrap(
+    ~ recipient
+  ) +
+  labs(
+    x = "S.D. Units Relative to Sample Mean",
+    y = NULL
+  ) +
+  xlim(c(-2.2, 2.2)) +
+  theme(
+    panel.grid.major.y = element_line(
+      color = "black"
+    ),
+    panel.grid.major.x = element_line(
+      color = "darkgrey"
+    )
+  )
+```
+
+```{r, fig.height=6, fig.width=6, fig.cap="Characterizing donor interests in Southeast Asia relative to the sample."}
+dt %>%
+  mutate(distance = -log(dist),
+         trade = asinh(trade)) %>%
+  mutate_if(
+    is.numeric,
+    ~ (.x - mean(.x)) / sd(.x)
+  ) %>%
+  filter(
+    donor %in% c("Japan", "France", "United States")
+  ) %>%
+  group_by(donor, recipient) %>%
+  summarize(
+    across(
+      c(ties, distance, trade, colony, ally),
+      list(
+        Mean = mean
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    recipient %in% east_asia
+  ) %>%
+  mutate(
+    recipient = ifelse(
+      str_detect(recipient, "Lao"),
+      "Laos",
+      recipient
+    )
+  ) %>%
+  pivot_longer(
+    3:ncol(.)
+  ) %>%
+  separate(
+    name, into = c("var", "stat"), sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>%
+  mutate(
+    var = rep(
+      c("Donor Interest", "Proximity", "Trade", "Colonies", "Alliances"),
+      len = n()
+    ) %>%
+      as.factor() %>%
+      relevel(ref = "Donor Interest")
+  ) %>%
+  ggplot() +
+  aes(
+    x = Mean,
+    y = var,
+    color = donor,
+    xmin = 0,
+    xmax = Mean
+  ) +
+  geom_vline(
+    xintercept = 0, lty = 2
+  ) +
+  geom_point(
+    size = 2.5,
+    position = position_dodge(0.5)
+  ) +
+  geom_errorbarh(
+    height = 0,
+    position = position_dodge(0.5)
+  ) +
+  facet_wrap(
+    ~ recipient
+  ) +
+  labs(
+    x = "S.D. Units Relative to Sample Mean",
+    y = NULL,
+    color = NULL
+  ) +
+  #xlim(c(-4, 4)) +
+  theme(
+    panel.grid.major.y = element_line(
+      color = "black"
+    ),
+    panel.grid.major.x = element_line(
+      color = "darkgrey"
+    ),
+    legend.position = "top"
+  )
+```
+
+
+```{r, fig.height=3.75, fig.width=6, fig.cap="ODA across 24 sectors to countries in Souteast Asia."}
+east_asia_ts %>%
+  group_by(donor, year) %>%
+  summarize(
+    aid = sum(aid)
+  ) %>%
+  ggplot() +
+  aes(
+    x = year,
+    y = aid / 10,
+    color = donor
+  ) +
+  geom_line(
+    size = 0.75
+  ) +
+  scale_x_continuous(
+    n.breaks = 10
+  ) +
+  scale_y_continuous(
+    labels = scales::comma
+  ) +
+  labs(
+    x = "Year",
+    y = "ODA (millions)",
+    color = NULL
+  ) +
+  theme_classic()
+```
+
+In terms of the foreign policy importance of these countries to donors, we observe considerable variation in the degree and sources of donor interest in the region. As in the previous figure, Figure 10 reports the measure of donor interest (DI) for each donor in each recipient in standard deviation units relative to the sample mean. In most cases, Japan has stronger interests compared to the other two donors, especially in Indonesia and Myanmar. However, France has slightly stronger interests than Japan in Cambodia and Laos, and just slightly weaker interests in Vietnam. The U.S., meanwhile, has stronger interests than both Japan and France in the Philippines.
+
+The figure also reports the values of the component measures of DI. Though a number of common drivers of donor interest reveal themselves, the pattern that immediately catches the eye is that France and the United States have their strongest interests in former colonies. However, despite the appearance of an outsized influence for colonial status, in the construction of the DI measure colonial past is given comparatively less weight relative to distance and alliances. Other factors, like trade, track quite consistently across donors and recipients as well. The most obvious difference in drivers is proximity. Given their location in Southeast Asia, Japan has closest geographic proximity to each of the aid recipients.
+
+While the data would predict that Japan has incentives hold top donor status in the region, there is little indication why either France or the United States would care to let Japan take the lead. To the contrary, they have reasons to compete for dominance in the region as well given their economic and colonial ties. Nonetheless, when it comes to giving aid to these countries, Japan's ODA commitments far exceed those of the other two donors. 
+
+The disparity in aid giving is stark. Figure 11 reports total ODA commitments across the 24 key development sectors defined by the OECD from these three donors from 1996 to 2014 in millions of 2017 constant U.S. dollars. While Japan's giving ranged from around 500 million to well over 2 billion dollars, the giving of France and the United States barely ever came close to 250 million dollars in total.^[The 2013 spike in Japanese aid is driven almost entirely by debt forgiveness to Myanmar (Burma) as a reward for progress on liberalizing reforms.]
+
+
+```{r, fig.height=3.75, fig.width=5, fig.cap="Who leads in Southeast Asia?"}
+east_asia_cs %>%
+  mutate(
+    recipient = ifelse(
+      str_detect(recipient, "Lao"),
+      "Laos",
+      recipient
+    )
+  ) %>%
+  ggplot() +
+  aes(
+      x = recipient,
+      y = aid_share,
+      fill = donor,
+      pattern = ifelse(lead_donor==0, "no", "yes")
+    ) +
+  geom_col_pattern(
+    color = "black",
+    pattern_fill = "black"
+  ) +
+  scale_pattern_manual(
+    values = c(yes = "stripe", no = "none")
+  ) +
+  labs(
+    x = NULL,
+    y = "Aid Share",
+    fill = NULL,
+    pattern = "Lead Donor?"
+  ) +
+  theme_classic() +
+  guides(
+    pattern = guide_legend(
+      override.aes = list(fill = "white")
+    ),
+    fill = guide_legend(
+      override.aes = list(pattern = "none")
+    )
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, hjust = 1
+    )
+  )
+```
+
+
+This outsized contribution of aid is consequently captured in the measure of lead donorship. Figure 12 shows the average aid shares contributed by donors to each recipient. Diagonal lines denote whether a donor ever held non-zero lead donorship in at least one year in the period under study. Out of the seven recipient countries, Japan has maintained lead donor status in six. The U.S. is the only other donor to hold lead donor status in the region, namely, in the Philippines. Though not captured by Figure 12, the United States' role as lead donor was short lived. Examination of lead donorship over time indicates that the U.S. only held lead donor status in the Philippines from 2011 to 2013.
+
+
+```{r, fig.height=3.75, fig.width=8, fig.cap="Comparative donor interest in Southeast Asia."}
+library(patchwork)
+east_asia_cs %>%
+  mutate(
+    recipient = ifelse(
+      str_detect(recipient, "Lao"),
+      "Lao",
+      recipient
+    )
+  ) %>%
+  ggplot() +
+  geom_point(
+    aes(
+      y = recipient,
+      x = ties_share,
+      color = donor
+    )
+  ) +
+  geom_vline(
+    xintercept = 0,
+    size = 0.75,
+    col = "darkgrey"
+  ) +
+  labs(
+    y = NULL,
+    x = "Donor Interest Share",
+    color = NULL,
+    title = "DI Share between Donors"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid.major.y = element_line(
+      linetype = 4, size = 0.75
+    )
+  ) -> p1
+east_asia_cs %>%
+  mutate(
+    recipient = ifelse(
+      str_detect(recipient, "Lao"),
+      "Lao",
+      recipient
+    )
+  ) %>%
+  ggplot() +
+  geom_point(
+    aes(
+      y = recipient,
+      x = donor_ties_share,
+      color = donor
+    )
+  ) +
+  geom_vline(
+    xintercept = 0,
+    size = 0.75,
+    col = "darkgrey"
+  ) +
+  labs(
+    y = NULL,
+    x = "Donor Interest Share",
+    color = NULL,
+    title = "DI Share within Donors"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid.major.y = element_line(
+      linetype = 4, size = 0.75
+    )
+  ) -> p2
+p1 + p2 + 
+  plot_layout(guides = "collect")
+```
+
+Many possible explanations may account for Japan's dominance. As noted in the forgoing analysis, resource constraints seem to play a role in facilitating lead donorship. However, this explanation has little currency in the case of Southeast Asia. The United States holds lead donor status with the greatest frequency across all developing countries relative to other DAC members and has the largest reserve of resources to do so as measured by GDP. Further, while Japan's average GDP from 1998 to 2014 was nearly double that of France, France nonetheless maintains lead donor status across all recipients with a frequency nearly equal to Japan.
+
+Alternatively, geographic proximity might have special relevance. Southeast Asia garnered unique attention from Japan dating back to Tokoyo's post-war reparations to countries in the region in the 1950s [@rudner1989]. More recently, scholars cite *Kokueki* (or national interest), as the critical motivating factor of [Japan's] foreign aid policies," especially with respect to trade in Asia and the Indo-Pacific [@schraederEtAl1998, 300].
+
+However, tempting as it is to credit to geography previously unrecognized explanatory power, a notable pattern in the data bears mention.^[The "stopping power of water" has fewer teeth when it comes to financial flows in a globalized world [@mearsheimer2001].] Figure 13 shows *comparative* donor interest in each recipient country with resepct to two different points of reference. The left panel shows the measure of comparative DI used in the main empirical analysis. This captures the relative strength of a donor's foreign policy interests in a recipient compared to other donors. Here, we clearly see the parity of donor interests in several of the recipients. However, the right panel shows comparative DI, not with respect to all donors in a given recipient, but for a given donor relative to its priorities elsewhere. Here, Japan stands out for its stronger interests in Southeast Asia compared to other areas of the world. France and the United States, alternatively, have comparatively stronger interests in different developing countries. 
+
+This captures an overlooked dimension of donor interest in the main analysis. While it in part matters for lead donorship which donor has stronger interests in a recipient relative to other donor governments, it also matters how interested a donor is in a recipient compared to its interests in other recipients. Japan's interests concentrate most in Southeast Asia. This means that Japan has the greatest incentive to dedicate the plurality of its aid budget to countries in the region. This confers it with a comparative advantage in supporting its foreign policy goals in Southeast Asia and, thus, seems a sensible explanation for its observed dominance.
+
+
+## South America
+
+In contrast with Southeast Asia, where Japan's unrivaled dominance was the puzzle, in South America the puzzle is the *lack* of dominance by the United States. Though there is no contemporary equivalent to the Monroe Doctrine in international development, for historical, material, and strategic reasons South American countries have special importance for U.S. foreign policy. Yet, in terms of the measure of lead donorship used in this study, a number of donor governments rival the United States in terms of foreign aid giving. Why does the U.S. not dominate in South America in the same way that Japan dominates in Southeast Asia?
+
+
+```{r}
+sth_am <- c(
+  "Argentina",
+  "Bolivia",
+  "Brazil",
+  "Chile",
+  "Colombia",
+  "Ecuador",
+  "Guyana",
+  "Paraguay",
+  "Peru",
+  "Suriname",
+  "Uruguay",
+  "Venezuela"
+)
+sth_am_donors <- (dt %>%
+  filter(
+    recipient %in% sth_am
+  ) %>%
+  group_by(
+    donor
+  ) %>%
+  summarize(
+    sum = sum(aid)
+  ) %>% 
+  slice_max(sum, n = 5))$donor
+dt %>%
+  filter(
+    donor %in% sth_am_donors,
+    recipient %in% sth_am
+  ) -> latin_ts
+latin_ts %>%
+  group_by(donor, recipient) %>%
+  summarize(
+    aid = mean(aid),
+    aid_share = mean(aid_share),
+    ties = mean(ties),
+    need = mean(need),
+    ties_share = mean(ties_share),
+    donor_ties_share = mean(donor_ties_share),
+    donor_gdp = mean(donor_gdp),
+    lead_donor = mean(lead_donor)
+  ) -> latin_cs
+```
+
+
+```{r, fig.height=6, fig.width=6, fig.cap="Characterizing need in South America relative to the sample."}
+dt %>%
+  mutate(fh = fh_total,
+         income = -log(income),
+         pop = log(pop),
+         disaster = asinh(disaster)) %>%
+  filter(
+    donor == "United States"
+  ) %>%
+  mutate_if(
+    is.numeric,
+    ~ (.x - mean(.x)) / sd(.x)
+  ) %>%
+  group_by(recipient) %>%
+  summarize(
+    across(
+      c(need, income, pop, disaster, civilwar, fh),
+      list(
+        Mean = mean
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    recipient %in% sth_am
+  ) %>%
+  pivot_longer(
+    2:ncol(.)
+  ) %>%
+  separate(
+    name, into = c("var", "stat"), sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>%
+  mutate(
+    var = rep(
+      c("Recipient Need", "Poverty", "Population", "Disaster Deaths", "Civil War", "Limits on Freedom"),
+      len = n()
+    ) %>%
+      as.factor() %>%
+      relevel(ref = "Recipient Need")
+  ) %>%
+  ggplot() +
+  aes(
+    x = Mean,
+    y = var
+  ) +
+  geom_vline(
+    xintercept = 0, lty = 2
+  ) +
+  geom_point(
+    color = "darkblue",
+    size = 3
+  ) +
+  facet_wrap(
+    ~ recipient
+  ) +
+  labs(
+    x = "S.D. Units Relative to Sample Mean",
+    y = NULL
+  ) +
+  xlim(c(-2.2, 2.2)) +
+  theme(
+    panel.grid.major.y = element_line(
+      color = "black"
+    ),
+    panel.grid.major.x = element_line(
+      color = "darkgrey"
+    )
+  )
+```
+
+The 11 developing countries in South America in the dataset are Argentina, Bolivia, Brazil, Chile, Colombia, Ecuador, Paraguay, Peru, Suriname, Uruguay, and Venezuela. Relative to Southeast Asia, these countries vary substantially in their relative need for aid, as shown in Figure 14. At one extreme is Suriname, which has comparatively low need for aid as measured by RN. In terms of the component measures of need, relative to the total sample, Suriname stands out for lower levels of poverty, its small population, comparatively few limits on political and civil liberties, lower death toll from natural disasters, and infrequent instances of political violence. At the other extreme, Colombia has the highest average value on the RN measure out of countries in South America. Its values on the component measures reveal that Colombia has greater need for aid due to its relatively large population, yearly average of natural disaster deaths, and frequency of civil war.
+
+
+```{r, fig.height=6, fig.width=6, fig.cap="Characterizing donor interests in South America relative to the sample."}
+dt %>%
+  mutate(distance = -log(dist),
+         trade = asinh(trade)) %>%
+  mutate_if(
+    is.numeric,
+    ~ (.x - mean(.x)) / sd(.x)
+  ) %>%
+  filter(
+    donor %in% sth_am_donors
+  ) %>%
+  group_by(donor, recipient) %>%
+  summarize(
+    across(
+      c(ties, distance, trade, colony, ally),
+      list(
+        Mean = mean
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    recipient %in% sth_am
+  ) %>%
+  pivot_longer(
+    3:ncol(.)
+  ) %>%
+  separate(
+    name, into = c("var", "stat"), sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>%
+  mutate(
+    var = rep(
+      c("Donor Interest", "Proximity", "Trade", "Colonies", "Alliances"),
+      len = n()
+    ) %>%
+      as.factor() %>%
+      relevel(ref = "Donor Interest")
+  ) %>%
+  ggplot() +
+  aes(
+    x = Mean,
+    y = var,
+    color = donor,
+    xmin = 0,
+    xmax = Mean
+  ) +
+  geom_vline(
+    xintercept = 0, lty = 2
+  ) +
+  geom_point(
+    size = 2.5,
+    position = position_dodge(0.5)
+  ) +
+  geom_errorbarh(
+    height = 0,
+    position = position_dodge(0.5)
+  ) +
+  facet_wrap(
+    ~ recipient
+  ) +
+  labs(
+    x = "S.D. Units Relative to Sample Mean",
+    y = NULL,
+    color = NULL
+  ) +
+  #xlim(c(-4, 4)) +
+  theme(
+    panel.grid.major.y = element_line(
+      color = "black"
+    ),
+    panel.grid.major.x = element_line(
+      color = "darkgrey"
+    ),
+    legend.position = "top"
+  )
+```
+
+A number of DAC members give aid to countries in South America, but the top five donors in terms of total contributions are France, Germany, Japan, Spain, and the United States. However, among these donors, only the U.S. and Spain stand out for their foreign policy interests in the region, as indicated by Figure 15. In terms of the component measures of DI, all of the donor governments have above average levels of trade with countries in South America, but the U.S. engages in the highest volume of trade across all aid recipients. These countries also have comparatively greater importance for the U.S. by virtue of their proximity. However, much of the difference in importance these recipients have for donors lies in the former colonial status of all but two South American countries for Spain and in the alliance status between all the recipients and the United States.
+
+By all accounts given the spread of recipient need in South America and the uniquely strong foreign policy interests of the U.S., it follows that the U.S. should have unequaled lead donor status in the region, particularly in the highest need recipients. Though Spain might seem like a possible contender, as highlighted in the previous analysis the U.S. should have a competitive advantage given its greater reserve of resources. Its average GDP from 1998 to 2014 exceeds that of Spain by a ratio of more than 10-to-1.
+
+
+```{r, fig.height=3.75, fig.width=5, fig.cap="Who leads in South America?"}
+latin_cs %>%
+  mutate(
+    recipient = ifelse(
+      str_detect(recipient, "Lao"),
+      "Lao",
+      recipient
+    )
+  ) %>%
+  ggplot() +
+  aes(
+      x = recipient,
+      y = aid_share,
+      fill = donor,
+      pattern = ifelse(lead_donor==0, "no", "yes")
+    ) +
+  geom_col_pattern(
+    color = "black",
+    pattern_fill = "black"
+  ) +
+  scale_pattern_manual(
+    values = c(yes = "stripe", no = "none")
+  ) +
+  labs(
+    x = NULL,
+    y = "Aid Share",
+    fill = NULL,
+    pattern = "Lead Donor?"
+  ) +
+  theme_classic() +
+  guides(
+    pattern = guide_legend(
+      override.aes = list(fill = "white")
+    ),
+    fill = guide_legend(
+      override.aes = list(pattern = "none")
+    )
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, hjust = 1
+    )
+  )
+```
+
+
+```{r, fig.height=3.75, fig.width=8, fig.cap="Comparative donor interest in South America."}
+latin_cs %>%
+  ggplot() +
+  geom_point(
+    aes(
+      y = recipient,
+      x = ties_share,
+      color = donor
+    )
+  ) +
+  geom_vline(
+    xintercept = 0,
+    size = 0.75,
+    col = "darkgrey"
+  ) +
+  labs(
+    y = NULL,
+    x = "Donor Interest Share",
+    color = NULL,
+    title = "DI Share between Donors"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid.major.y = element_line(
+      size = 0.75, linetype = 4
+    )
+  ) -> p1
+latin_cs %>%
+  ggplot() +
+  geom_point(
+    aes(
+      y = recipient,
+      x = donor_ties_share,
+      color = donor
+    )
+  ) +
+  geom_vline(
+    xintercept = 0,
+    size = 0.75,
+    col = "darkgrey"
+  ) +
+  labs(
+    y = NULL,
+    x = "Donor Interest Share",
+    color = NULL,
+    title = "DI Share within Donors"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid.major.y = element_line(
+      size = 0.75, linetype = 4
+    )
+  ) -> p2
+p1 + p2 + plot_layout(guides = "collect")
+```
+
+
+Nonetheless, as Figure 16 highlights, in terms of average aid shares in each recipient, not only does the United States not comprise the largest share of total aid giving in several recipients, it also has held non-zero lead donorship in only three of the 11 countries in South America in the dataset. At the same time, the other four top donors to the region have held lead donor status for at least a year in one or several recipients.
+
+Unlike with Japan in Southeast Asia, an explanation that relies on comparative interests in the region does not apply in the case of South America. Figure 17 shows in the left panel the average comparative DI measure used in the main empirical analysis for each donor in each recipient. The right panel shows average comparative DI, but with respect to a donor's interest in a recipient relative to its interests elsewhere. In both cases, the United States has comparatively strong interests in South America, followed by Spain.
+
+```{r, fig.height=3.75, fig.width=6, fig.cap="ODA across 24 sectors to countries in South America."}
+latin_ts %>%
+  group_by(donor, year) %>%
+  summarize(
+    aid = sum(aid)
+  ) %>%
+  ggplot() +
+  aes(
+    x = year,
+    y = aid / 10,
+    color = donor
+  ) +
+  geom_line(
+    size = 0.75
+  ) +
+  scale_x_continuous(
+    n.breaks = 10
+  ) +
+  scale_y_continuous(
+    labels = scales::comma
+  ) +
+  labs(
+    x = "Year",
+    y = "ODA (millions)",
+    color = NULL
+  ) +
+  theme_classic()
+```
+
+
+Some clues begin to emerge by inspecting the total contributions of donors to the region over time. Figure 18 shows total ODA commitments across the 24 development sectors in millions of U.S. dollars to the 11 aid recipients in South America included in the data. Between 2000 and 2008, the United States' contributions to the region vastly exceed those of the other four donor governments. This trend starts to change after 2008, and by 2012 France, Germany, and Japan's giving either exceeds or approaches the United States'. This shift coincides not just with the decline in U.S. aid, but also with an increase in aid from these other donors.
+
+This change cannot be linked to particular covariates in the dataset. Instead, it can be traced to shifts in other political and material factors at work in the United States and in South America.^[Details come from the Congressional Research Service Report titled ["U.S. Foreign Assistance to Latin America and the Caribbean: FY2021 Appropriations"](https://sgp.fas.org/crs/row/R46514.pdf) published Jan. 7, 2021. Accessed Feb. 23, 2022.] Throughout much of the 2000s the U.S. prioritized combating drug trafficking and putting and end to conflict, particularly in Colombia, but also in several of its neighbors. Starting with the Clinton Administration and continuing under Bush, a succession of initiatives and resources were allotted in support of this goal, which accounts for the outsized ODA commitments to the region by the U.S. during this period.
+
+However, in the wake of the 2008 financial crisis and subsequent recession, Washington made widespread cuts in its foreign assistance, not only in South America, but globally. At the same time, the twenty-first century saw several South American countries experience economic growth. Some aid recipients even became aid donors, sending assistance to other countries in the region. Perhaps most notably, beginning in 2011 some recipient governments, including Bolivia's, effectively boycotted U.S. assistance in their countries by rejecting aid projects and expelling U.S. personnel. Leaders of these countries cited U.S. "meddling and conspiring against the government" as their reason for proscribing U.S. aid.^[["Bolivian President Evo Morales orders expulsion of USAID."](https://www.cnn.com/2013/05/01/world/americas/bolivia-usaid-expelled/index.html) Published by *CNN* on May 1, 2013. Accessed Feb. 23, 2022.]
+
+
+```{r, fig.height=4, fig.width=6, fig.cap="Frequency of non-zero lead donorship in South America per year."}
+latin_ts %>%
+  group_by(donor, year) %>%
+  summarize(
+    lead_donor = sum(lead_donor > 0)
+  ) %>%
+  ggplot() +
+  aes(
+    x = year,
+    y = donor,
+    fill = lead_donor
+  ) +
+  geom_tile(color = "black") +
+  scale_fill_gradient(
+    low = "white",
+    high = "darkblue",
+  ) +
+  scale_x_continuous(
+    breaks = 1998:2014,
+    position = "top"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Lead Donor Count \n"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.title = element_text(face = "bold"),
+    legend.position = "top",
+    axis.text.x = element_text(angle = 45, hjust = 0),
+    axis.ticks = element_blank()
+  )
+```
+
+These changes, in turn, map to shifts in lead donorship in South America over time. Figure 19 notes the yearly count of recipients per donor where said donor has non-zero lead donor status. The high of U.S. leadership is 2001 and 2002, with sustained leadership in at least two recipients from 2000 to 2008. This period of relative dominance coincides with lower levels of lead donorship among the other four donors. We then witness a shift after 2008 where the U.S. dominates in only one recipient (this happens to be Colombia) while Japan, Germany, and France---the donors with the least foreign policy interests in the region---hold lead donorship with progressively greater frequency.
+
+The surprising lack of sustained and widespread lead donorship by the United States in South America, then, highlights an obvious role for political and material factors beyond those captured in the main analysis in determining when and where lead donorship emerges. However, to stop here is to ignore an additional, perhaps more interesting, insight: *the U.S. is an exception that proves the rule.*
+
+Consider Figures 18 and 19 in tandem and note, not only how U.S. aid shifts over time, but also how the other donor governments' aid shifts in parallel. Spain, which is the only other donor among the top five in the region to have foreign policy interests in the region that approach the intensity of those of the U.S., gives more aid and holds sustained lead donor status in at least one recipient primarily during years that overlap with greater U.S. giving and frequency of lead donorship. Conversely, the donors that lack strong interests in the region---France, Germany, and Japan---tend to give more aid and hold lead donor status with greatest frequency when the U.S. does not. 
+
+This pattern is precisely what is predicted by theory. Strong foreign policy interests in high need recipients should correspond to greater rivalry among donor governments. Conversely, weak foreign policy interests in high need recipients should correspond to greater co-benefits. Donors should compete in the first scenario as they seek to maximize their foreign policy objectives, while in the second scenario donors should defer responsibility for giving aid to the extent that others are willing to take the lead. 
+
+The behavior of Spain in response to shifts in U.S. aid is consistent with the former---the more (less) aid the U.S. gives, the more (less) Spain must give to compete. The behavior of France, Germany, and Japan is consistent with the latter---the less (more) aid the U.S. gives, the less (more) these donors must give to continue to support development projects. Thus, even while the level of aid giving by the U.S. in South America appears puzzling at first blush, the giving of other donors in response to aid from the U.S. fits well with what theory predicts.
+
+
+# Conclusion
+
+This analysis supports the view that lead donorship emerges as a product of strategic interactions among donor governments. Donors take the lead in high need developing countries when and where they have strong foreign policy interests relative to others. Comparatively strong interests give donors an incentive to dominate in their relationship with recipients to maximize their ability to leverage economic, strategic, and political foreign policy goals in developing countries. The absence of such goals gives donors an incentive to show deference to the extent that other donors give greater aid. Examination of lead donorship in Southeast Asia and South America provides additional support for this argument while also highlighting other material and political factors that facilitate or preclude lead donorship.
+
+Taken together, this study provides the first systematic assessment of the determinants of lead donorship and provides a helpful theoretical basis for explaining when and where it emerges. Several questions and tensions, of course, remain. One point of tension lies between the theoretical account spelled out here and that argued by @steinwand2015. He contends that lead donorship can arise either from uncoordinated behavior or from collusion. Specifically, lead donorship may result from uncooperative buck-passing when and where aid produces collective benefits for the donor community, or from patronage-like agreements to defer responsibility to a single donor when and where rival foreign policy goals are in play. 
+
+This analysis supports the former, but certainly does not rule out the latter. The main limitation in resolving this issue is that a clear and unproblematic measure of when and where cooperation is at work is not available. In his own analysis, @steinwand2015 claims that conditioning donor responses on the presence of lead donorship helps to uncover when and where it promotes coordination. However, the analysis here highlights why this is problematic, namely, that the presence of lead donorship is endogenous to the strategic factors and donor responses that give rise to it. The evidence provided here suggests lead donorship follows from an uncoordinated general equilibrium. At the very least, it provides little basis to suggest much more, and until a way of reliably capturing collusion is developed it will be difficult to demonstrate otherwise. 
+
+At the same time, this study does not rule out an explanatory role for cooperation. This is a worthy question for future research, and perhaps this analysis may provide a foundation for leveraging a relevant measure. Some outlier cases, for example, would be a useful place to look for evidence.
+
+This study also has implications for scholars studying aid effectiveness. One of the key mechanisms thought to explain when and where foreign aid maps to development is aid conditionality [@bearceTirone2010; @girod2012]. How does lead donorship relate to the ability of donor governments to credibly commit to conditions on aid? On the one hand, lead donors should have greater ability to impose conditions on receipt of aid. This would suggest that lead donorship has positive implications for economic development. On the other hand, since lead donors hold that status by virtue of their outsized foreign policy interests, this may have negative consequences for development. The presence of non-development goals makes it harder for donors to commit to conditionality since cutting aid subjects them to unacceptable disutility.
+
+This study hopefully provides a theoretical and empirical foundation for addressing these issues. Moreover, it hopefully offers insights that will facilitate more informed discussions about donor cooperation. Such debates often rely on one-dimensional understandings of what drives donor responses to each other, to wit, that donors principally care either about development or about other strategic and economic foreign policy goals. Though it has always been understood that donor motives are mixed, variation between motives and what this variation implies has remained unclear---until now.
+
+\clearpage
+
+# Appendix
+
+Table A.1 shows summary statistics for the full data sample used in the main empirical analysis. ODA and trade are in millions of 2017 U.S. dollars. Table A.2 shows regression coefficients for two alternative model specifications and reports estimates using both the full data sample and a sample restricted to only to donors that every hold lead donor status. CR1 standard errors are reported and are clustered by dyad. Columns 1 and 3 show OLS estimates from a linear fractional model, and columns 2 and 4 show OLS estimates from a fractional model where the outcome is logit transformed prior to estimation: $\log\left[\text{Lead Donor}_{ijt} / \left( 1 - \text{Lead Donor}_{ijt}\right) \right]$. To adjust for degenerate cases (perfect 0 and 1 values), these cases are coded to 0.001 and 0.999 respectively. Estimates from these models are consistent with those presented in the main analysis.
+
+\captionsetup{labelformat=AppendixTables}
+\setcounter{table}{0}
+
+```{r, results='asis'}
+dt %>%
+  rename(
+    leaddonor = lead_donor,
+    tiesshare = ties_share,
+    fh = fh_total
+  ) %>%
+  mutate(
+    trade = trade / 1000000
+  ) %>%
+  summarize(
+    across(c(aid, leaddonor, tiesshare, need, income, pop, 
+             disaster, fh, civilwar, dist, trade, colony, ally),
+           list(Mean = mean, Median = median, S.D. = sd, Min. = min, Max. = max))
+  ) %>%
+  pivot_longer(
+    everything()
+  ) %>%
+  separate(
+    name, into = c("Variable", "stat"), sep = "_"
+  ) %>%
+  mutate(
+    Variable = rep(
+      c("ODA", "Lead Donor", "DI share", "RN",
+        "Income", "Population", "Disaster", "Freedom House", 
+        "Civil War", "Distance (km)", "Trade", "Colony", "Alliance"),
+      each = 5
+    )
+  ) %>%
+  pivot_wider(
+    values_from = "value",
+    names_from = "stat"
+  ) %>%
+  kableExtra::kbl(
+    caption = "Summary Statistics",
+    booktabs = T,
+    digits = 3,
+    format.args = list(big.mark = ","),
+    linesep = ""
+  ) %>%
+  kableExtra::kable_styling(
+    latex_options = "hold_position"
+  )
+texreg(
+  list("(1)" = fit1, "(2)" = fit2, "(3)" = fit1.small, "(4)" = fit2.small),
+  include.ci = F,
+  custom.coef.map = list(
+    "ties_share" = "$\\tilde{\\mbox{DI}}_{ijt}$",
+    "need" = "$\\mbox{RN}_{jt}$",
+    "ties_share:need" = "$\\mbox{RN}_{jt} \\times \\tilde{\\mbox{DI}}_{ijt}$"
+  ),
+  custom.header = list(
+    "Full Sample" = 1:2,
+    "Only Lead Donors" = 3:4
+  ),
+  caption = "Robustness Checks",
+  caption.above = T,
+  custom.gof.rows = list(
+    "Donor FE" = rep("Yes", len = 4),
+    "Year FE" = rep("Yes", len = 4),
+    "Dyad RE" = rep("No", len = 4),
+    "N" = c(rep(scales::comma(nrow(dt)), len = 2), 
+            rep(scales::comma(nrow(small_dt)), len = 2)),
+    "Dyads" = c(rep(scales::comma(length(unique(dt$dyad))), len = 2),
+                rep(scales::comma(length(unique(small_dt$dyad))), len = 2))
+  ),
+  include.rmse = F,
+  include.rsquared = F,
+  include.aic = F,
+  include.bic = F,
+  include.log = F,
+  include.deviance = F,
+  include.dispersion = F,
+  include.gcv = F,
+  include.nsmooth = F,
+  include.nobs = F,
+  include.nclusts = F
+)%>% cat()
+```
+
+
+
+\clearpage
+
+# References
+

@@ -1,0 +1,379 @@
+---
+title: "Data Cleaning"
+author: "Miles D. Williams"
+date: "7/1/2020"
+output: html_document
+abstract: This file contains script to create a cleaned data frame for later analysis.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+library(tidyverse)
+
+# load crs data
+
+crs = read_csv('crs_data_1995_2017.csv')
+crs %>%
+  spread(
+    key = donor,
+    value = aid
+  ) -> crs_wide
+crs_wide[is.na(crs_wide)] <- 0
+crs_wide %>%
+  gather(
+    key = "donor",
+    value = "aid",
+    -recipient,-sector,-year
+  ) -> crs
+
+# load penn world data v9
+
+pwt_r = pwt9::pwt9.1 %>%
+  select(country, year, pop, rgdpna) %>%
+  mutate(rgdpna = rgdpna/pop) %>%
+  rename(recipient = country,
+         income = rgdpna) %>%
+  mutate(recipient = as.character(recipient))
+
+pwt_d = pwt9::pwt9.1 %>%
+  select(country, year, pop, rgdpna) %>%
+  rename(donor = country,
+         donor_pop = pop,
+         donor_gdp = rgdpna) %>%
+  mutate(donor = as.character(donor))
+
+# update country codes
+library(countrycode)
+
+crs %>%
+  mutate(
+    dcode = countrycode(
+      donor, origin = 'country.name',
+      destination = 'iso3c'
+    ),
+    rcode = countrycode(
+      recipient, origin = 'country.name',
+      destination = 'iso3c'
+    )
+  ) -> crs
+
+pwt_d %>%
+  mutate(
+    dcode = countrycode(
+      donor, origin = 'country.name',
+      destination = 'iso3c'
+    )
+  ) -> pwt_d
+
+pwt_r %>%
+  mutate(
+    rcode = countrycode(
+      recipient, origin = 'country.name',
+      destination = 'iso3c'
+    )
+  ) -> pwt_r
+
+# look at NA codes in crs
+crs %>%
+  filter(is.na(rcode)) %>%
+  count(recipient)
+
+# get rid of them
+crs %>% 
+  filter(!is.na(rcode)) -> crs
+
+# merge
+
+left_join(crs,pwt_r,by=c('year','rcode')) %>%
+  left_join(pwt_d,by=c('dcode','year')) -> dt1
+
+
+# cepii data
+cepii = haven::read_dta('dist_cepii.dta')
+
+cepii %>%
+  rename(dcode = iso_o,
+         rcode = iso_d) -> cepii
+
+# merge
+
+left_join(dt1,cepii,by=c('rcode','dcode')) -> dt2
+
+
+# get disaster data
+disaster = read_csv('deaths-natural-disasters-ihme.csv')
+
+disaster %>%
+  mutate(
+    rcode = countrycode(
+      recipient, origin = 'country.name',
+      destination = 'iso3c'
+    ) 
+  ) -> disaster
+
+# a bunch of regional names were in the data
+# get rid of them
+
+disaster %>%
+  filter(!is.na(rcode)) -> disaster
+
+# merge
+
+left_join(
+  dt2, disaster, by = c('year','rcode')
+) -> dt3
+
+
+# trade data
+
+trade1 = read_csv('trade1.csv')
+trade2 = read_csv('trade2.csv')
+trade = rbind(trade1,trade2)
+
+dt4 = left_join(dt3, trade, by = c('year','rcode','dcode'))
+
+
+# democracy data
+library(democracyData)
+fh=download_fh(verbose=F)%>%
+  rename(recipient=fh_country)%>%
+  select(recipient,year,fh_total)%>%
+  mutate(rcode=countrycode(
+    recipient,
+    origin='country.name',
+    destination='iso3c'
+  ),
+  fh_total = max(fh_total,na.rm=T) - fh_total)
+pt=download_polity_annual(verbose=F)%>%
+  rename(recipient=polity_annual_country)%>%
+  select(recipient,year,polity2)%>%
+  mutate(rcode=countrycode(
+    recipient,
+    origin='country.name',
+    destination='iso3c'
+  ))
+dt5=left_join(dt4,fh,by=c('year','rcode'))
+dt6=left_join(dt5,pt,by=c('year','rcode'))
+
+# conflict data
+#cw=read_csv('conflict_data.csv')
+#cw=cw%>%select(rcode,country,year,civwar)%>%
+#  rename(recipient=country)
+cw = read_csv('prio_civilwars.csv')
+cw = cw %>% select(-conflict_id) %>%
+  rename(recipient=location) %>%
+  mutate(rcode=countrycode(
+    recipient,
+    origin='country.name',
+    destination='iso3c'
+  ))
+
+dt7=left_join(dt6,cw,by=c('year','rcode'))
+dt7$civilwar[is.na(dt7$civilwar)] = 0
+
+# US military aid
+us=read_csv('us_mil.csv') %>%
+  rename(year = fiscal_year,
+         usmil = constant_amount) %>%
+  mutate(
+    rcode = countrycode(
+      country_name, origin = 'country.name',
+      destination = 'iso3c'
+    )
+  ) %>%
+  select(rcode,year,usmil)
+us=us %>% 
+  filter(!is.na(rcode)) %>% 
+  mutate(year=as.numeric(year)) %>%
+  group_by(year,rcode) %>%
+  summarize(usmil = sum(usmil,na.rm=T)) %>%
+  ungroup()
+
+dt8=left_join(dt7,us,by=c('year','rcode'))
+dt8$usmil[is.na(dt8$usmil)] = 0
+
+# alliances
+allies=read_csv('alliances.csv')
+allies=allies%>%
+  mutate(
+    dcode=countrycode(
+      mem1, origin = 'cown',
+      destination = 'iso3c'
+    ),
+    rcode=countrycode(
+      mem2, origin = 'cown',
+      destination = 'iso3c'
+    )
+  ) %>%
+  select(year,dcode,rcode,atopally)
+allies = allies %>% filter(!is.na(dcode),!is.na(rcode))
+
+dt9=left_join(dt8,allies,by=c('year','dcode','rcode'))
+dt9$atopally[is.na(dt9$atopally)]=0
+
+write_csv(dt9,'analysis_dt0.csv')
+
+api = read_csv('api_data.csv')
+
+
+# how does this look in the analysis?
+
+dt = read_csv('analysis_dt0.csv')
+dt_small = dt %>%
+  rename(donor=donor.x,
+         recipient=recipient.x) %>%
+  group_by(donor, recipient, year) %>%
+  summarise(
+    aid = sum(aid,na.rm=T)*(sum(aid,na.rm=T)>=0),
+    pop = median(pop,na.rm=T),
+    income = median(income,na.rm=T),
+    donor_pop = median(donor_pop,na.rm=T),
+    donor_gdp = median(donor_gdp,na.rm=T),
+    colony = median(colony,na.rm=T),
+    dist = median(dist,na.rm=T),
+    disaster = median(disaster,na.rm=T),
+    trade = median(trade,na.rm=T),
+    fh_total = median(fh_total,na.rm=T),
+    #polity2 = median(polity2,na.rm=T),
+    civilwar = median(civilwar,na.rm=T),
+    usmil = median(usmil,na.rm=T),
+    ally = median(atopally,na.rm=T)
+  ) %>%
+  group_by(recipient, year) %>%
+  mutate(
+    peer_aid = sum(aid,na.rm=T) - aid,
+    N = n()
+  ) %>%
+  group_by(donor, year) %>%
+  mutate(
+    peer_aid_all = sum(peer_aid,na.rm=T)-peer_aid
+  ) %>%
+  ungroup() %>%
+  mutate(dyad = paste0(donor,recipient,sep='-'))
+
+# get measure of ties
+
+findPCA = function(vars){
+  
+  # standardize values...
+  vars = tieVars %>%
+    mutate_all(function(x)(x-mean(x))/sd(x)) %>%
+    as.matrix()
+  
+  # make the objective...
+  objective = function(vars, w){
+    pc = vars %*% w
+    sc = apply(vars,2,function(x) (cov(pc,x)^2))
+    ssc = sum(sc)
+    return(-ssc)
+  }
+  
+  # run the optimizer...
+  out = optim(
+    fn = objective,
+    vars = vars,
+    par=rep(0,len=ncol(vars))
+  )
+  
+  # get the pc...
+  pc = as.matrix(vars)%*%out$par
+  
+  # standardize the pc...
+  pc = (pc-mean(pc))/sd(pc)
+  
+  # get correlations with components...
+  cors = apply(vars,2,function(x)cor(x,pc))
+  
+  # return the pc and cor. matrix...
+  return(
+    list(
+      pc = pc,
+      corMat = cors
+    )
+  )
+}
+
+
+
+# test with data
+dt_na = na.omit(dt_small)
+tieVars = dt_na %>%
+  select(trade,dist,ally,colony) %>%
+  mutate(trade=asinh(trade),
+         dist=asinh(dist))
+needVars = dt_na %>%
+  select(income,pop,disaster,civilwar,fh_total) %>%
+  mutate(income=asinh(income),
+         pop=asinh(pop),
+         disaster=asinh(disaster))
+ties = findPCA(tieVars)
+need = findPCA(needVars)
+
+dt_na$ties <- -ties$pc[,1]
+dt_na$need <- -need$pc[,1]
+
+
+dt_na = dt_na %>%
+  mutate(
+    ihs_aid = asinh(aid),
+    ihs_peer_aid = asinh(peer_aid),
+    ihs_peer_aid_all = asinh(peer_aid_all),
+    ihs_donor_gdp = asinh(donor_gdp),
+    ihs_donor_pop = asinh(donor_pop),
+    ihs_usmil = asinh(usmil),
+    ihs_trade = asinh(trade),
+    ihs_dist = asinh(dist),
+    ihs_disaster = asinh(disaster),
+    ihs_inc = asinh(income),
+    ihs_pop = asinh(pop)
+  ) %>%
+  group_by(donor,year) %>%
+  mutate(tot_aid = sum(aid) - aid) %>%
+  mutate(donor_inc = donor_gdp - tot_aid) %>%
+  mutate(ihs_inc = asinh(donor_inc)) %>%
+  group_by(year) %>%
+  mutate(
+    ln_peer_gdp = asinh(sum(donor_gdp)-donor_gdp),
+    ln_peer_pop = asinh((sum(donor_pop)-donor_pop))
+  ) 
+
+# add api
+
+api_ave = api %>%
+  group_by(donor) %>%
+  summarize(
+    api = mean(api)
+  ) %>%
+  ungroup()
+dt_na = dt_na %>%
+  left_join(api_ave,by='donor') %>%
+  group_by(year) %>%
+  mutate(peer_api = sum(api) - api) %>%
+  ungroup()
+
+
+
+dt_na = dt_na %>%
+  group_by(donor) %>%
+  mutate(
+    api_wt = peer_api/max(peer_api)
+  ) %>%
+  group_by(recipient,year) %>%
+  mutate(
+    peer_aid_wt = sum(
+      aid*api_wt
+    ) - aid*api_wt
+  ) %>% ungroup() %>%
+  mutate(
+    ihs_peer_aid_wt = asinh(peer_aid_wt)
+  )
+
+# save dataset for analysis
+write_csv(dt_na,'final_data.csv')
+```
+
